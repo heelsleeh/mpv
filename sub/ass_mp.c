@@ -96,8 +96,14 @@ void mp_ass_configure_fonts(ASS_Renderer *priv, struct osd_style_opts *opts,
     if (default_font && !mp_path_exists(default_font))
         default_font = NULL;
 
+    int font_provider = ASS_FONTPROVIDER_AUTODETECT;
+    if (opts->font_provider == 1)
+        font_provider = ASS_FONTPROVIDER_NONE;
+    if (opts->font_provider == 2)
+        font_provider = ASS_FONTPROVIDER_FONTCONFIG;
+
     mp_verbose(log, "Setting up fonts...\n");
-    ass_set_fonts(priv, default_font, opts->font, 1, config, 1);
+    ass_set_fonts(priv, default_font, opts->font, font_provider, config, 1);
     mp_verbose(log, "Done.\n");
 
     talloc_free(tmp);
@@ -134,7 +140,6 @@ ASS_Library *mp_ass_init(struct mpv_global *global, struct mp_log *log)
     ass_set_message_cb(priv, message_callback, log);
     if (path)
         ass_set_fonts_dir(priv, path);
-    ass_set_extract_fonts(priv, global->opts->use_embedded_fonts);
     talloc_free(path);
     return priv;
 }
@@ -225,8 +230,10 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
     {
         talloc_free(p->cached_img);
         p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
-        if (!p->cached_img)
+        if (!p->cached_img) {
+            packer_reset(p->packer);
             return false;
+        }
         talloc_steal(p, p->cached_img);
     }
 

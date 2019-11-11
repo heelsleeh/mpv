@@ -31,30 +31,34 @@ extern const struct ra_hwdec_driver ra_hwdec_videotoolbox;
 extern const struct ra_hwdec_driver ra_hwdec_vdpau;
 extern const struct ra_hwdec_driver ra_hwdec_dxva2egl;
 extern const struct ra_hwdec_driver ra_hwdec_d3d11egl;
-extern const struct ra_hwdec_driver ra_hwdec_d3d11eglrgb;
 extern const struct ra_hwdec_driver ra_hwdec_dxva2gldx;
 extern const struct ra_hwdec_driver ra_hwdec_dxva2;
 extern const struct ra_hwdec_driver ra_hwdec_d3d11va;
+extern const struct ra_hwdec_driver ra_hwdec_dxva2dxgi;
 extern const struct ra_hwdec_driver ra_hwdec_cuda;
 extern const struct ra_hwdec_driver ra_hwdec_cuda_nvdec;
 extern const struct ra_hwdec_driver ra_hwdec_rpi_overlay;
 extern const struct ra_hwdec_driver ra_hwdec_drmprime_drm;
 
 const struct ra_hwdec_driver *const ra_hwdec_drivers[] = {
-#if HAVE_VAAPI_EGL
+#if HAVE_VAAPI_EGL || HAVE_VAAPI_VULKAN
     &ra_hwdec_vaegl,
 #endif
 #if HAVE_VIDEOTOOLBOX_GL || HAVE_IOS_GL
     &ra_hwdec_videotoolbox,
 #endif
 #if HAVE_D3D_HWACCEL
+ #if HAVE_EGL_ANGLE
     &ra_hwdec_d3d11egl,
-    &ra_hwdec_d3d11eglrgb,
- #if HAVE_D3D9_HWACCEL
+  #if HAVE_D3D9_HWACCEL
     &ra_hwdec_dxva2egl,
+  #endif
  #endif
  #if HAVE_D3D11
     &ra_hwdec_d3d11va,
+  #if HAVE_D3D9_HWACCEL
+    &ra_hwdec_dxva2dxgi,
+  #endif
  #endif
 #endif
 #if HAVE_GL_DXINTEROP_D3D9
@@ -66,7 +70,7 @@ const struct ra_hwdec_driver *const ra_hwdec_drivers[] = {
 #if HAVE_VDPAU_GL_X11
     &ra_hwdec_vdpau,
 #endif
-#if HAVE_RPI
+#if HAVE_RPI_MMAL
     &ra_hwdec_rpi_overlay,
 #endif
 #if HAVE_DRMPRIME && HAVE_DRM

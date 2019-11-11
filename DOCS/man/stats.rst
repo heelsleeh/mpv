@@ -23,6 +23,7 @@ stats:
 ====   ==================
 1      Show usual stats
 2      Show frame timings
+3      Input cache stats
 ====   ==================
 
 Font
@@ -35,7 +36,7 @@ monospaced digits is recommended. By default, the open source font
 Configuration
 -------------
 
-This script can be customized through a config file ``lua-settings/stats.conf``
+This script can be customized through a config file ``script-opts/stats.conf``
 placed in mpv's user directory and through the ``--script-opts`` command-line
 option. The configuration syntax is described in `ON SCREEN CONTROLLER`_.
 
@@ -53,6 +54,8 @@ Configurable Options
     Default: 1
 ``key_page_2``
     Default: 2
+``key_page_3``
+    Default: 3
 
     Key bindings for page switching while stats are displayed.
 

@@ -84,7 +84,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     if (!sw->fns->start_frame(sw, &fbo))
         return;
 
-    gl_video_render_frame(p->renderer, frame, fbo);
+    gl_video_render_frame(p->renderer, frame, fbo, RENDER_FRAME_DEF);
     if (!sw->fns->submit_frame(sw, frame)) {
         MP_ERR(vo, "Failed presenting frame!\n");
         return;
@@ -96,6 +96,14 @@ static void flip_page(struct vo *vo)
     struct gpu_priv *p = vo->priv;
     struct ra_swapchain *sw = p->ctx->swapchain;
     sw->fns->swap_buffers(sw);
+}
+
+static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+{
+    struct gpu_priv *p = vo->priv;
+    struct ra_swapchain *sw = p->ctx->swapchain;
+    if (sw->fns->get_vsync)
+        sw->fns->get_vsync(sw, info);
 }
 
 static int query_format(struct vo *vo, int format)
@@ -168,7 +176,6 @@ static void get_and_update_ambient_lighting(struct gpu_priv *p)
 static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct gpu_priv *p = vo->priv;
-    struct ra_swapchain *sw = p->ctx->swapchain;
 
     switch (request) {
     case VOCTRL_SET_PANSCAN:
@@ -177,15 +184,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_SET_EQUALIZER:
         vo->want_redraw = true;
         return VO_TRUE;
-    case VOCTRL_SCREENSHOT_WIN: {
-        struct mp_image *screen = NULL;
-        if (sw->fns->screenshot)
-            screen = sw->fns->screenshot(sw);
-        if (!screen)
-            break; // redirect to backend
-        // set image parameters according to the display, if possible
-        screen->params.color = gl_video_get_output_colorspace(p->renderer);
-        *(struct mp_image **)data = screen;
+    case VOCTRL_SCREENSHOT: {
+        struct vo_frame *frame = vo_get_current_vo_frame(vo);
+        if (frame)
+            gl_video_screenshot(p->renderer, frame, data);
+        talloc_free(frame);
         return true;
     }
     case VOCTRL_LOAD_HWDEC_API:
@@ -203,9 +206,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_PAUSE:
         if (gl_video_showing_interpolated_frame(p->renderer))
             vo->want_redraw = true;
-        break;
+        return true;
     case VOCTRL_PERFORMANCE_DATA:
         gl_video_perfdata(p->renderer, (struct voctrl_performance_data *)data);
+        return true;
+    case VOCTRL_EXTERNAL_RESIZE:
+        p->ctx->fns->reconfig(p->ctx);
+        resize(vo);
         return true;
     }
 
@@ -308,13 +315,8 @@ static const m_option_t options[] = {
     OPT_STRING_VALIDATE("gpu-api", context_type, 0, ra_ctx_validate_api),
     OPT_FLAG("gpu-debug", opts.debug, 0),
     OPT_FLAG("gpu-sw", opts.allow_sw, 0),
-    OPT_INTRANGE("swapchain-depth", opts.swapchain_depth, 0, 1, 8),
     {0}
 };
-
-static const struct gpu_priv defaults = { .opts = {
-    .swapchain_depth = 3,
-}};
 
 const struct vo_driver video_out_gpu = {
     .description = "Shader-based GPU Renderer",
@@ -327,10 +329,10 @@ const struct vo_driver video_out_gpu = {
     .get_image = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
+    .get_vsync = get_vsync,
     .wait_events = wait_events,
     .wakeup = wakeup,
     .uninit = uninit,
     .priv_size = sizeof(struct gpu_priv),
-    .priv_defaults = &defaults,
     .options = options,
 };

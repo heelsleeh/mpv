@@ -27,6 +27,7 @@ enum af_format {
     AF_FORMAT_U8,
     AF_FORMAT_S16,
     AF_FORMAT_S32,
+    AF_FORMAT_S64,
     AF_FORMAT_FLOAT,
     AF_FORMAT_DOUBLE,
 
@@ -34,6 +35,7 @@ enum af_format {
     AF_FORMAT_U8P,
     AF_FORMAT_S16P,
     AF_FORMAT_S32P,
+    AF_FORMAT_S64P,
     AF_FORMAT_FLOATP,
     AF_FORMAT_DOUBLEP,
 
@@ -64,12 +66,10 @@ bool af_fmt_is_pcm(int format);
 int af_fmt_to_planar(int format);
 int af_fmt_from_planar(int format);
 
-// Amount of bytes that contain audio of the given duration, aligned to frames.
-int af_fmt_seconds_to_bytes(int format, float seconds, int channels, int samplerate);
-
 void af_fill_silence(void *dst, size_t bytes, int format);
 
-void af_get_best_sample_formats(int src_format, int out_formats[AF_FORMAT_COUNT]);
+void af_get_best_sample_formats(int src_format, int *out_formats);
+int af_format_conversion_score(int dst_format, int src_format);
 int af_select_best_samplerate(int src_sampelrate, const int *available);
 
 int af_format_sample_alignment(int format);

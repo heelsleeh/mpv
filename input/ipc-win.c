@@ -29,6 +29,7 @@
 #include "common/msg.h"
 #include "input/input.h"
 #include "libmpv/client.h"
+#include "options/m_config.h"
 #include "options/options.h"
 #include "player/client.h"
 
@@ -304,7 +305,7 @@ done:
         CloseHandle(arg->write_ol.hEvent);
 
     CloseHandle(arg->client_h);
-    mpv_detach_destroy(arg->client);
+    mpv_destroy(arg->client);
     talloc_free(arg);
     return NULL;
 }
@@ -316,7 +317,7 @@ static void ipc_start_client(struct mp_ipc_ctx *ctx, struct client_arg *client)
 
     pthread_t client_thr;
     if (pthread_create(&client_thr, NULL, client_thread, client)) {
-        mpv_detach_destroy(client->client);
+        mpv_destroy(client->client);
         CloseHandle(client->client_h);
         talloc_free(client);
     }
@@ -449,7 +450,7 @@ done:
 struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
                                struct mpv_global *global)
 {
-    struct MPOpts *opts = global->opts;
+    struct MPOpts *opts = mp_get_config_group(NULL, global, GLOBAL_CONFIG);
 
     struct mp_ipc_ctx *arg = talloc_ptrtype(NULL, arg);
     *arg = (struct mp_ipc_ctx){
@@ -478,12 +479,14 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
     if (pthread_create(&arg->thread, NULL, ipc_thread, arg))
         goto out;
 
+    talloc_free(opts);
     return arg;
 
 out:
     if (arg->death_event)
         CloseHandle(arg->death_event);
     talloc_free(arg);
+    talloc_free(opts);
     return NULL;
 }
 

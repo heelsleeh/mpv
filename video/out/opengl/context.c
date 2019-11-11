@@ -125,17 +125,6 @@ done:
     return ret;
 }
 
-static void *get_native_display(void *priv, const char *name)
-{
-    struct priv *p = priv;
-    if (!p->params.native_display_type || !name)
-        return NULL;
-    if (strcmp(p->params.native_display_type, name) != 0)
-        return NULL;
-
-    return p->params.native_display;
-}
-
 void ra_gl_ctx_uninit(struct ra_ctx *ctx)
 {
     if (ctx->swapchain) {
@@ -173,8 +162,6 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
     if (ext) {
         if (ext->color_depth)
             p->fns.color_depth = ext->color_depth;
-        if (ext->screenshot)
-            p->fns.screenshot = ext->screenshot;
         if (ext->start_frame)
             p->fns.start_frame = ext->start_frame;
         if (ext->submit_frame)
@@ -193,8 +180,6 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
     }
 
     gl->debug_context = ctx->opts.debug;
-    gl->get_native_display_ctx = p;
-    gl->get_native_display = get_native_display;
 
     if (gl->SwapInterval) {
         gl->SwapInterval(p->opts->swapinterval);
@@ -247,29 +232,13 @@ int ra_gl_ctx_color_depth(struct ra_swapchain *sw)
     return depth_g;
 }
 
-struct mp_image *ra_gl_ctx_screenshot(struct ra_swapchain *sw)
-{
-    struct priv *p = sw->priv;
-
-    assert(p->wrapped_fb);
-    struct mp_image *screen = gl_read_fbo_contents(p->gl, p->main_fb,
-                                                   p->wrapped_fb->params.w,
-                                                   p->wrapped_fb->params.h);
-
-    // OpenGL FB is also read in flipped order, so we need to flip when the
-    // rendering is *not* flipped, which in our case is whenever
-    // p->params.flipped is true. I hope that made sense
-    if (screen && p->params.flipped)
-        mp_image_vflip(screen);
-
-    return screen;
-}
-
 bool ra_gl_ctx_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
     struct priv *p = sw->priv;
-    out_fbo->tex = p->wrapped_fb;
-    out_fbo->flip = !p->params.flipped; // OpenGL FBs are normally flipped
+    *out_fbo = (struct ra_fbo) {
+         .tex = p->wrapped_fb,
+         .flip = !p->params.flipped, // OpenGL FBs are normally flipped
+    };
     return true;
 }
 
@@ -339,17 +308,25 @@ void ra_gl_ctx_swap_buffers(struct ra_swapchain *sw)
             check_pattern(p, step);
     }
 
-    while (p->num_vsync_fences >= sw->ctx->opts.swapchain_depth) {
+    while (p->num_vsync_fences >= sw->ctx->vo->opts->swapchain_depth) {
         gl->ClientWaitSync(p->vsync_fences[0], GL_SYNC_FLUSH_COMMANDS_BIT, 1e9);
         gl->DeleteSync(p->vsync_fences[0]);
         MP_TARRAY_REMOVE_AT(p->vsync_fences, p->num_vsync_fences, 0);
     }
 }
 
+static void ra_gl_ctx_get_vsync(struct ra_swapchain *sw,
+                                struct vo_vsync_info *info)
+{
+    struct priv *p = sw->priv;
+    if (p->params.get_vsync)
+        p->params.get_vsync(sw->ctx, info);
+}
+
 static const struct ra_swapchain_fns ra_gl_swapchain_fns = {
     .color_depth   = ra_gl_ctx_color_depth,
-    .screenshot    = ra_gl_ctx_screenshot,
     .start_frame   = ra_gl_ctx_start_frame,
     .submit_frame  = ra_gl_ctx_submit_frame,
     .swap_buffers  = ra_gl_ctx_swap_buffers,
+    .get_vsync     = ra_gl_ctx_get_vsync,
 };

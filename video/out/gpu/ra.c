@@ -4,6 +4,26 @@
 
 #include "ra.h"
 
+void ra_add_native_resource(struct ra *ra, const char *name, void *data)
+{
+    struct ra_native_resource r = {
+        .name = name,
+        .data = data,
+    };
+    MP_TARRAY_APPEND(ra, ra->native_resources, ra->num_native_resources, r);
+}
+
+void *ra_get_native_resource(struct ra *ra, const char *name)
+{
+    for (int n = 0; n < ra->num_native_resources; n++) {
+        struct ra_native_resource *r = &ra->native_resources[n];
+        if (strcmp(r->name, name) == 0)
+            return r->data;
+    }
+
+    return NULL;
+}
+
 struct ra_tex *ra_tex_create(struct ra *ra, const struct ra_tex_params *params)
 {
     return ra->fns->tex_create(ra, params);
@@ -315,7 +335,7 @@ void ra_dump_tex_formats(struct ra *ra, int msgl)
     if (!mp_msg_test(ra->log, msgl))
         return;
     MP_MSG(ra, msgl, "Texture formats:\n");
-    MP_MSG(ra, msgl, "  NAME       COMP*TYPE SIZE        DEPTH PER COMP.\n");
+    MP_MSG(ra, msgl, "  NAME       COMP*TYPE SIZE           DEPTH PER COMP.\n");
     for (int n = 0; n < ra->num_formats; n++) {
         const struct ra_format *fmt = ra->formats[n];
         const char *ctype = "unknown";
@@ -331,15 +351,17 @@ void ra_dump_tex_formats(struct ra *ra, int msgl)
             if (fmt->component_size[i] != fmt->component_depth[i])
                 mp_snprintf_cat(cl, sizeof(cl), "/%d", fmt->component_depth[i]);
         }
-        MP_MSG(ra, msgl, "  %-10s %d*%s %3dB %s %s %s {%s}\n", fmt->name,
+        MP_MSG(ra, msgl, "  %-10s %d*%s %3dB %s %s %s %s {%s}\n", fmt->name,
                fmt->num_components, ctype, fmt->pixel_size,
                fmt->luminance_alpha ? "LA" : "  ",
                fmt->linear_filter ? "LF" : "  ",
-               fmt->renderable ? "CR" : "  ", cl);
+               fmt->renderable ? "CR" : "  ",
+               fmt->storable ? "ST" : "  ", cl);
     }
     MP_MSG(ra, msgl, " LA = LUMINANCE_ALPHA hack format\n");
     MP_MSG(ra, msgl, " LF = linear filterable\n");
     MP_MSG(ra, msgl, " CR = can be used for render targets\n");
+    MP_MSG(ra, msgl, " ST = can be used for storable images\n");
 }
 
 void ra_dump_imgfmt_desc(struct ra *ra, const struct ra_imgfmt_desc *desc,

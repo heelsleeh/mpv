@@ -21,13 +21,14 @@
 #include "common/common.h"
 #include "common/playlist.h"
 #include "stream/stream.h"
+#include "misc/natural_sort.h"
 #include "demux.h"
 
 #include "stream/stream_libarchive.h"
 
 static int cmp_filename(const void *a, const void *b)
 {
-    return strcmp(*(char **)a, *(char **)b);
+    return mp_natural_sort_cmp(*(char **)a, *(char **)b);
 }
 
 static int open_file(struct demuxer *demuxer, enum demux_check check)
@@ -42,14 +43,17 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
         probe_size *= 100;
     }
 
-    bstr probe = stream_peek(demuxer->stream, probe_size);
-    if (probe.len == 0)
+    void *probe = ta_alloc_size(NULL, probe_size);
+    if (!probe)
         return -1;
-    struct stream *probe_stream = open_memory_stream(probe.start, probe.len);
+    int probe_got = stream_read_peek(demuxer->stream, probe, probe_size);
+    struct stream *probe_stream =
+        stream_memory_open(demuxer->global, probe, probe_got);
     struct mp_archive *mpa = mp_archive_new(mp_null_log, probe_stream, flags);
     bool ok = !!mpa;
     free_stream(probe_stream);
     mp_archive_free(mpa);
+    ta_free(probe);
     if (!ok)
         return -1;
 
@@ -85,6 +89,7 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     demuxer->fully_read = true;
 
     mp_archive_free(mpa);
+    demux_close_stream(demuxer);
 
     return 0;
 }

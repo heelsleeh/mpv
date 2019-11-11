@@ -82,7 +82,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
 #if HAVE_OPENSLES
     &audio_out_opensles,
 #endif
-#if HAVE_SDL1 || HAVE_SDL2
+#if HAVE_SDL2_AUDIO
     &audio_out_sdl,
 #endif
 #if HAVE_SNDIO
@@ -93,9 +93,7 @@ static const struct ao_driver * const audio_out_drivers[] = {
     &audio_out_coreaudio_exclusive,
 #endif
     &audio_out_pcm,
-#if HAVE_ENCODING
     &audio_out_lavc,
-#endif
 #if HAVE_RSOUND
     &audio_out_rsound,
 #endif
@@ -122,7 +120,7 @@ static bool get_desc(struct m_obj_desc *dst, int index)
 }
 
 // For the ao option
-const struct m_obj_list ao_obj_list = {
+static const struct m_obj_list ao_obj_list = {
     .get_desc = get_desc,
     .description = "audio outputs",
     .allow_unknown_entries = true,
@@ -131,13 +129,30 @@ const struct m_obj_list ao_obj_list = {
     .use_global_options = true,
 };
 
+#define OPT_BASE_STRUCT struct ao_opts
+const struct m_sub_options ao_conf = {
+    .opts = (const struct m_option[]) {
+        OPT_SETTINGSLIST("ao", audio_driver_list, 0, &ao_obj_list, ),
+        OPT_STRING("audio-device", audio_device, UPDATE_AUDIO),
+        OPT_STRING("audio-client-name", audio_client_name, UPDATE_AUDIO),
+        OPT_DOUBLE("audio-buffer", audio_buffer, M_OPT_MIN | M_OPT_MAX,
+                   .min = 0, .max = 10),
+        {0}
+    },
+    .size = sizeof(OPT_BASE_STRUCT),
+    .defaults = &(const OPT_BASE_STRUCT){
+        .audio_buffer = 0.2,
+        .audio_device = "auto",
+        .audio_client_name = "mpv",
+    },
+};
+
 static struct ao *ao_alloc(bool probing, struct mpv_global *global,
                            void (*wakeup_cb)(void *ctx), void *wakeup_ctx,
                            char *name)
 {
     assert(wakeup_cb);
 
-    struct MPOpts *opts = global->opts;
     struct mp_log *log = mp_log_new(NULL, global->log, "ao");
     struct m_obj_desc desc;
     if (!m_obj_list_find(&desc, &ao_obj_list, bstr0(name))) {
@@ -145,6 +160,7 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
         talloc_free(log);
         return NULL;
     };
+    struct ao_opts *opts = mp_get_config_group(NULL, global, &ao_conf);
     struct ao *ao = talloc_ptrtype(NULL, ao);
     talloc_steal(ao, log);
     *ao = (struct ao) {
@@ -157,6 +173,7 @@ static struct ao *ao_alloc(bool probing, struct mpv_global *global,
         .def_buffer = opts->audio_buffer,
         .client_name = talloc_strdup(ao, opts->audio_client_name),
     };
+    talloc_free(opts);
     ao->priv = m_config_group_from_desc(ao, ao->log, global, &desc, name);
     if (!ao->priv)
         goto error;
@@ -232,6 +249,7 @@ static struct ao *ao_init(bool probing, struct mpv_global *global,
     if (ao->device_buffer)
         MP_VERBOSE(ao, "device buffer: %d samples.\n", ao->device_buffer);
     ao->buffer = MPMAX(ao->device_buffer, ao->def_buffer * ao->samplerate);
+    ao->buffer = MPMAX(ao->buffer, 1);
 
     int align = af_format_sample_alignment(ao->format);
     ao->buffer = (ao->buffer + align - 1) / align * align;
@@ -268,8 +286,8 @@ struct ao *ao_init_best(struct mpv_global *global,
                         struct encode_lavc_context *encode_lavc_ctx,
                         int samplerate, int format, struct mp_chmap channels)
 {
-    struct MPOpts *opts = global->opts;
     void *tmp = talloc_new(NULL);
+    struct ao_opts *opts = mp_get_config_group(tmp, global, &ao_conf);
     struct mp_log *log = mp_log_new(tmp, global->log, "ao");
     struct ao *ao = NULL;
     struct m_obj_settings *ao_list = NULL;
@@ -384,6 +402,7 @@ void ao_reset(struct ao *ao)
 {
     if (ao->api->reset)
         ao->api->reset(ao);
+    atomic_fetch_and(&ao->events_, ~(unsigned int)AO_EVENT_UNDERRUN);
 }
 
 // Pause playback. Keep the current buffer. ao_get_delay() must return the
@@ -421,7 +440,7 @@ int ao_query_and_reset_events(struct ao *ao, int events)
     return atomic_fetch_and(&ao->events_, ~(unsigned)events) & events;
 }
 
-static void ao_add_events(struct ao *ao, int events)
+void ao_add_events(struct ao *ao, int events)
 {
     atomic_fetch_or(&ao->events_, events);
     ao->wakeup_cb(ao->wakeup_ctx);
@@ -437,6 +456,14 @@ void ao_request_reload(struct ao *ao)
 void ao_hotplug_event(struct ao *ao)
 {
     ao_add_events(ao, AO_EVENT_HOTPLUG);
+}
+
+void ao_underrun_event(struct ao *ao)
+{
+    // Racy check, but it's just for the message.
+    if (!(atomic_load(&ao->events_) & AO_EVENT_UNDERRUN))
+        MP_WARN(ao, "Device underrun detected.\n");
+    ao_add_events(ao, AO_EVENT_UNDERRUN);
 }
 
 bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
@@ -497,6 +524,11 @@ const char *ao_get_name(struct ao *ao)
 const char *ao_get_description(struct ao *ao)
 {
     return ao->driver->description;
+}
+
+bool ao_get_reports_underruns(struct ao *ao)
+{
+    return ao->driver->reports_underruns;
 }
 
 bool ao_untimed(struct ao *ao)

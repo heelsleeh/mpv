@@ -334,6 +334,10 @@ static const float SLOG_A = 0.432699,
 // Linearize (expand), given a TRC as input. In essence, this is the ITU-R
 // EOTF, calculated on an idealized (reference) monitor with a white point of
 // MP_REF_WHITE and infinite contrast.
+//
+// These functions always output to a normalized scale of [0,1], for
+// convenience of the video.c code that calls it. To get the values in an
+// absolute scale, multiply the result by `mp_trc_nom_peak(trc)`
 void pass_linearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
 {
     if (trc == MP_CSP_TRC_LINEAR)
@@ -360,8 +364,17 @@ void pass_linearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
     case MP_CSP_TRC_GAMMA18:
         GLSL(color.rgb = pow(color.rgb, vec3(1.8));)
         break;
+    case MP_CSP_TRC_GAMMA20:
+        GLSL(color.rgb = pow(color.rgb, vec3(2.0));)
+        break;
     case MP_CSP_TRC_GAMMA22:
         GLSL(color.rgb = pow(color.rgb, vec3(2.2));)
+        break;
+    case MP_CSP_TRC_GAMMA24:
+        GLSL(color.rgb = pow(color.rgb, vec3(2.4));)
+        break;
+    case MP_CSP_TRC_GAMMA26:
+        GLSL(color.rgb = pow(color.rgb, vec3(2.6));)
         break;
     case MP_CSP_TRC_GAMMA28:
         GLSL(color.rgb = pow(color.rgb, vec3(2.8));)
@@ -376,7 +389,7 @@ void pass_linearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
         GLSLF("color.rgb = max(color.rgb - vec3(%f), vec3(0.0)) \n"
               "             / (vec3(%f) - vec3(%f) * color.rgb);\n",
               PQ_C1, PQ_C2, PQ_C3);
-        GLSLF("color.rgb = pow(color.rgb, vec3(1.0/%f));\n", PQ_M1);
+        GLSLF("color.rgb = pow(color.rgb, vec3(%f));\n", 1.0 / PQ_M1);
         // PQ's output range is 0-10000, but we need it to be relative to to
         // MP_REF_WHITE instead, so rescale
         GLSLF("color.rgb *= vec3(%f);\n", 10000 / MP_REF_WHITE);
@@ -417,6 +430,8 @@ void pass_linearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
 // Delinearize (compress), given a TRC as output. This corresponds to the
 // inverse EOTF (not the OETF) in ITU-R terminology, again assuming a
 // reference monitor.
+//
+// Like pass_linearize, this functions ingests values on an normalized scale
 void pass_delinearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
 {
     if (trc == MP_CSP_TRC_LINEAR)
@@ -439,8 +454,17 @@ void pass_delinearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
     case MP_CSP_TRC_GAMMA18:
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/1.8));)
         break;
+    case MP_CSP_TRC_GAMMA20:
+        GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.0));)
+        break;
     case MP_CSP_TRC_GAMMA22:
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.2));)
+        break;
+    case MP_CSP_TRC_GAMMA24:
+        GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.4));)
+        break;
+    case MP_CSP_TRC_GAMMA26:
+        GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.6));)
         break;
     case MP_CSP_TRC_GAMMA28:
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.8));)
@@ -488,24 +512,25 @@ void pass_delinearize(struct gl_shader_cache *sc, enum mp_csp_trc trc)
 }
 
 // Apply the OOTF mapping from a given light type to display-referred light.
-// The extra peak parameter is used to scale the values before and after
-// the OOTF, and can be inferred using mp_trc_nom_peak
-void pass_ootf(struct gl_shader_cache *sc, enum mp_csp_light light, float peak)
+// Assumes absolute scale values. `peak` is used to tune the OOTF where
+// applicable (currently only HLG).
+static void pass_ootf(struct gl_shader_cache *sc, enum mp_csp_light light,
+                      float peak)
 {
     if (light == MP_CSP_LIGHT_DISPLAY)
         return;
 
     GLSLF("// apply ootf\n");
-    GLSLF("color.rgb *= vec3(%f);\n", peak);
 
     switch (light)
     {
-    case MP_CSP_LIGHT_SCENE_HLG:
-        // HLG OOTF from BT.2100, assuming a reference display with a
-        // peak of 1000 cd/m² -> gamma = 1.2
-        GLSLF("color.rgb *= vec3(%f * pow(dot(src_luma, color.rgb), 0.2));\n",
-              (1000 / MP_REF_WHITE) / pow(12, 1.2));
+    case MP_CSP_LIGHT_SCENE_HLG: {
+        // HLG OOTF from BT.2100, scaled to the chosen display peak
+        float gamma = MPMAX(1.0, 1.2 + 0.42 * log10(peak * MP_REF_WHITE / 1000.0));
+        GLSLF("color.rgb *= vec3(%f * pow(dot(src_luma, color.rgb), %f));\n",
+              peak / pow(12, gamma), gamma - 1.0);
         break;
+    }
     case MP_CSP_LIGHT_SCENE_709_1886:
         // This OOTF is defined by encoding the result as 709 and then decoding
         // it as 1886; although this is called 709_1886 we actually use the
@@ -521,25 +546,26 @@ void pass_ootf(struct gl_shader_cache *sc, enum mp_csp_light light, float peak)
     default:
         abort();
     }
-
-    GLSLF("color.rgb *= vec3(1.0/%f);\n", peak);
 }
 
 // Inverse of the function pass_ootf, for completeness' sake.
-void pass_inverse_ootf(struct gl_shader_cache *sc, enum mp_csp_light light, float peak)
+static void pass_inverse_ootf(struct gl_shader_cache *sc, enum mp_csp_light light,
+                              float peak)
 {
     if (light == MP_CSP_LIGHT_DISPLAY)
         return;
 
     GLSLF("// apply inverse ootf\n");
-    GLSLF("color.rgb *= vec3(%f);\n", peak);
 
     switch (light)
     {
-    case MP_CSP_LIGHT_SCENE_HLG:
-        GLSLF("color.rgb *= vec3(1.0/%f);\n", (1000 / MP_REF_WHITE) / pow(12, 1.2));
-        GLSL(color.rgb /= vec3(max(1e-6, pow(dot(src_luma, color.rgb), 0.2/1.2)));)
+    case MP_CSP_LIGHT_SCENE_HLG: {
+        float gamma = MPMAX(1.0, 1.2 + 0.42 * log10(peak * MP_REF_WHITE / 1000.0));
+        GLSLF("color.rgb *= vec3(1.0/%f);\n", peak / pow(12, gamma));
+        GLSLF("color.rgb /= vec3(max(1e-6, pow(dot(src_luma, color.rgb), %f)));\n",
+              (gamma - 1.0) / gamma);
         break;
+    }
     case MP_CSP_LIGHT_SCENE_709_1886:
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.4));)
         GLSL(color.rgb = mix(color.rgb * vec3(1.0/4.5),
@@ -553,72 +579,118 @@ void pass_inverse_ootf(struct gl_shader_cache *sc, enum mp_csp_light light, floa
     default:
         abort();
     }
+}
 
-    GLSLF("color.rgb *= vec3(1.0/%f);\n", peak);
+// Average light level for SDR signals. This is equal to a signal level of 0.5
+// under a typical presentation gamma of about 2.0.
+static const float sdr_avg = 0.25;
+
+static void hdr_update_peak(struct gl_shader_cache *sc,
+                            const struct gl_tone_map_opts *opts)
+{
+    // Update the sig_peak/sig_avg from the old SSBO state
+    GLSL(if (average.y > 0.0) {)
+    GLSL(    sig_avg  = max(1e-3, average.x);)
+    GLSL(    sig_peak = max(1.00, average.y);)
+    GLSL(})
+
+    // Chosen to avoid overflowing on an 8K buffer
+    const float log_min = 1e-3, log_scale = 400.0, sig_scale = 10000.0;
+
+    // For performance, and to avoid overflows, we tally up the sub-results per
+    // pixel using shared memory first
+    GLSLH(shared int wg_sum;)
+    GLSLH(shared uint wg_max;)
+    GLSL(wg_sum = 0; wg_max = 0;)
+    GLSL(barrier();)
+    GLSLF("float sig_log = log(max(sig_max, %f));\n", log_min);
+    GLSLF("atomicAdd(wg_sum, int(sig_log * %f));\n", log_scale);
+    GLSLF("atomicMax(wg_max, uint(sig_max * %f));\n", sig_scale);
+
+    // Have one thread per work group update the global atomics
+    GLSL(memoryBarrierShared();)
+    GLSL(barrier();)
+    GLSL(if (gl_LocalInvocationIndex == 0) {)
+    GLSL(    int wg_avg = wg_sum / int(gl_WorkGroupSize.x * gl_WorkGroupSize.y);)
+    GLSL(    atomicAdd(frame_sum, wg_avg);)
+    GLSL(    atomicMax(frame_max, wg_max);)
+    GLSL(    memoryBarrierBuffer();)
+    GLSL(})
+    GLSL(barrier();)
+
+    // Finally, to update the global state, we increment a counter per dispatch
+    GLSL(uint num_wg = gl_NumWorkGroups.x * gl_NumWorkGroups.y;)
+    GLSL(if (gl_LocalInvocationIndex == 0 && atomicAdd(counter, 1) == num_wg - 1) {)
+    GLSL(    counter = 0;)
+    GLSL(    vec2 cur = vec2(float(frame_sum) / float(num_wg), frame_max);)
+    GLSLF("  cur *= vec2(1.0/%f, 1.0/%f);\n", log_scale, sig_scale);
+    GLSL(    cur.x = exp(cur.x);)
+    GLSL(    if (average.y == 0.0))
+    GLSL(        average = cur;)
+
+    // Use an IIR low-pass filter to smooth out the detected values, with a
+    // configurable decay rate based on the desired time constant (tau)
+    float a = 1.0 - cos(1.0 / opts->decay_rate);
+    float decay = sqrt(a*a + 2*a) - a;
+    GLSLF("  average += %f * (cur - average);\n", decay);
+
+    // Scene change hysteresis
+    float log_db = 10.0 / log(10.0);
+    GLSLF("  float weight = smoothstep(%f, %f, abs(log(cur.x / average.x)));\n",
+          opts->scene_threshold_low / log_db,
+          opts->scene_threshold_high / log_db);
+    GLSL(    average = mix(average, cur, weight);)
+
+    // Reset SSBO state for the next frame
+    GLSL(    frame_sum = 0; frame_max = 0;)
+    GLSL(    memoryBarrierBuffer();)
+    GLSL(})
 }
 
 // Tone map from a known peak brightness to the range [0,1]. If ref_peak
 // is 0, we will use peak detection instead
-static void pass_tone_map(struct gl_shader_cache *sc, float ref_peak,
-                          enum tone_mapping algo, float param, float desat)
+static void pass_tone_map(struct gl_shader_cache *sc,
+                          float src_peak, float dst_peak,
+                          const struct gl_tone_map_opts *opts)
 {
     GLSLF("// HDR tone mapping\n");
 
     // To prevent discoloration due to out-of-bounds clipping, we need to make
     // sure to reduce the value range as far as necessary to keep the entire
     // signal in range, so tone map based on the brightest component.
-    GLSL(float sig = max(max(color.r, color.g), color.b);)
+    GLSL(int sig_idx = 0;)
+    GLSL(if (color[1] > color[sig_idx]) sig_idx = 1;)
+    GLSL(if (color[2] > color[sig_idx]) sig_idx = 2;)
+    GLSL(float sig_max = color[sig_idx];)
+    GLSLF("float sig_peak = %f;\n", src_peak);
+    GLSLF("float sig_avg = %f;\n", sdr_avg);
 
-    // Desaturate the color using a coefficient dependent on the signal
-    if (desat > 0) {
-        GLSL(float luma = dot(dst_luma, color.rgb);)
-        GLSL(float coeff = max(sig - 0.18, 1e-6) / max(sig, 1e-6););
-        GLSLF("coeff = pow(coeff, %f);\n", 10.0 / desat);
-        GLSL(color.rgb = mix(color.rgb, vec3(luma), coeff);)
-        GLSL(sig = mix(sig, luma, coeff);) // also make sure to update `sig`
+    if (opts->compute_peak >= 0)
+        hdr_update_peak(sc, opts);
+
+    GLSLF("vec3 sig = color.rgb;\n");
+
+    // Rescale the variables in order to bring it into a representation where
+    // 1.0 represents the dst_peak. This is because all of the tone mapping
+    // algorithms are defined in such a way that they map to the range [0.0, 1.0].
+    if (dst_peak > 1.0) {
+        GLSLF("sig *= 1.0/%f;\n", dst_peak);
+        GLSLF("sig_peak *= 1.0/%f;\n", dst_peak);
     }
 
-    if (!ref_peak) {
-        // For performance, we want to do as few atomic operations on global
-        // memory as possible, so use an atomic in shmem for the work group.
-        // We also want slightly more stable values, so use the group average
-        // instead of the group max
-        GLSLHF("shared uint group_sum = 0;\n");
-        GLSLF("atomicAdd(group_sum, uint(sig * %f));\n", MP_REF_WHITE);
+    GLSL(float sig_orig = sig[sig_idx];)
+    GLSLF("float slope = min(%f, %f / sig_avg);\n", opts->max_boost, sdr_avg);
+    GLSL(sig *= slope;)
+    GLSL(sig_peak *= slope;)
 
-        // Have one thread in each work group update the frame maximum
-        GLSL(memoryBarrierBuffer();)
-        GLSL(barrier();)
-        GLSL(if (gl_LocalInvocationIndex == 0))
-            GLSL(atomicMax(frame_max[index], group_sum /
-                 (gl_WorkGroupSize.x * gl_WorkGroupSize.y));)
-
-        // Finally, have one thread per invocation update the total maximum
-        // and advance the index
-        GLSL(memoryBarrierBuffer();)
-        GLSL(barrier();)
-        GLSL(if (gl_GlobalInvocationID == ivec3(0)) {) // do this once per invocation
-            GLSLF("uint next = (index + 1) %% %d;\n", PEAK_DETECT_FRAMES+1);
-            GLSLF("sig_peak_raw = sig_peak_raw + frame_max[index] - frame_max[next];\n");
-            GLSLF("frame_max[next] = %d;\n", (int)MP_REF_WHITE);
-            GLSL(index = next;)
-        GLSL(})
-
-        GLSL(memoryBarrierBuffer();)
-        GLSL(barrier();)
-        GLSLF("float sig_peak = 1.0/%f * float(sig_peak_raw);\n",
-              MP_REF_WHITE * PEAK_DETECT_FRAMES);
-    } else {
-        GLSLHF("const float sig_peak = %f;\n", ref_peak);
-    }
-
-    GLSL(float sig_orig = sig;)
-    switch (algo) {
+    float param = opts->curve_param;
+    switch (opts->curve) {
     case TONE_MAPPING_CLIP:
         GLSLF("sig = %f * sig;\n", isnan(param) ? 1.0 : param);
         break;
 
     case TONE_MAPPING_MOBIUS:
+        GLSLF("if (sig_peak > (1.0 + 1e-6)) {\n");
         GLSLF("const float j = %f;\n", isnan(param) ? 0.3 : param);
         // solve for M(j) = j; M(sig_peak) = 1.0; M'(j) = 1.0
         // where M(x) = scale * (x+a)/(x+b)
@@ -626,13 +698,15 @@ static void pass_tone_map(struct gl_shader_cache *sc, float ref_peak,
         GLSLF("float b = (j*j - 2.0*j*sig_peak + sig_peak) / "
               "max(1e-6, sig_peak - 1.0);\n");
         GLSLF("float scale = (b*b + 2.0*b*j + j*j) / (b-a);\n");
-        GLSL(sig = sig > j ? scale * (sig + a) / (sig + b) : sig;)
+        GLSLF("sig = mix(sig, scale * (sig + vec3(a)) / (sig + vec3(b)),"
+              "          greaterThan(sig, vec3(j)));\n");
+        GLSLF("}\n");
         break;
 
     case TONE_MAPPING_REINHARD: {
         float contrast = isnan(param) ? 0.5 : param,
               offset = (1.0 - contrast) / contrast;
-        GLSLF("sig = sig / (sig + %f);\n", offset);
+        GLSLF("sig = sig / (sig + vec3(%f));\n", offset);
         GLSLF("float scale = (sig_peak + %f) / sig_peak;\n", offset);
         GLSL(sig *= scale;)
         break;
@@ -640,19 +714,25 @@ static void pass_tone_map(struct gl_shader_cache *sc, float ref_peak,
 
     case TONE_MAPPING_HABLE: {
         float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
-        GLSLHF("float hable(float x) {\n");
-        GLSLHF("return ((x * (%f*x + %f)+%f)/(x * (%f*x + %f) + %f)) - %f;\n",
-               A, C*B, D*E, A, B, D*F, E/F);
+        GLSLHF("vec3 hable(vec3 x) {\n");
+        GLSLHF("return (x * (%f*x + vec3(%f)) + vec3(%f)) / "
+               "       (x * (%f*x + vec3(%f)) + vec3(%f)) "
+               "       - vec3(%f);\n",
+               A, C*B, D*E,
+               A, B, D*F,
+               E/F);
         GLSLHF("}\n");
-        GLSL(sig = hable(sig) / hable(sig_peak);)
+        GLSLF("sig = hable(max(vec3(0.0), sig)) / hable(vec3(sig_peak)).x;\n");
         break;
     }
 
     case TONE_MAPPING_GAMMA: {
         float gamma = isnan(param) ? 1.8 : param;
-        GLSLF("const float cutoff = 0.05, gamma = %f;\n", 1.0/gamma);
-        GLSL(float scale = pow(cutoff / sig_peak, gamma) / cutoff;)
-        GLSL(sig = sig > cutoff ? pow(sig / sig_peak, gamma) : scale * sig;)
+        GLSLF("const float cutoff = 0.05, gamma = 1.0/%f;\n", gamma);
+        GLSL(float scale = pow(cutoff / sig_peak, gamma.x) / cutoff;)
+        GLSLF("sig = mix(scale * sig,"
+              "          pow(sig / sig_peak, vec3(gamma)),"
+              "          greaterThan(sig, vec3(cutoff)));\n");
         break;
     }
 
@@ -666,30 +746,34 @@ static void pass_tone_map(struct gl_shader_cache *sc, float ref_peak,
         abort();
     }
 
-    // Apply the computed scale factor to the color, linearly to prevent
-    // discoloration
-    GLSL(color.rgb *= sig / sig_orig;)
+    GLSL(sig = min(sig, vec3(1.0));)
+    GLSL(vec3 sig_lin = color.rgb * (sig[sig_idx] / sig_orig);)
+
+    // Mix between the per-channel tone mapped and the linear tone mapped
+    // signal based on the desaturation strength
+    if (opts->desat > 0) {
+        float base = 0.18 * dst_peak;
+        GLSLF("float coeff = max(sig[sig_idx] - %f, 1e-6) / "
+              "              max(sig[sig_idx], 1.0);\n", base);
+        GLSLF("coeff = %f * pow(coeff, %f);\n", opts->desat, opts->desat_exp);
+        GLSLF("color.rgb = mix(sig_lin, %f * sig, coeff);\n", dst_peak);
+    } else {
+        GLSL(color.rgb = sig_lin;)
+    }
 }
 
 // Map colors from one source space to another. These source spaces must be
 // known (i.e. not MP_CSP_*_AUTO), as this function won't perform any
 // auto-guessing. If is_linear is true, we assume the input has already been
-// linearized (e.g. for linear-scaling). If `detect_peak` is true, we will
-// detect the peak instead of relying on metadata. Note that this requires
-// the caller to have already bound the appropriate SSBO and set up the
-// compute shader metadata
-void pass_color_map(struct gl_shader_cache *sc,
+// linearized (e.g. for linear-scaling). If `opts->compute_peak` is true, we
+// will detect the peak instead of relying on metadata. Note that this requires
+// the caller to have already bound the appropriate SSBO and set up the compute
+// shader metadata
+void pass_color_map(struct gl_shader_cache *sc, bool is_linear,
                     struct mp_colorspace src, struct mp_colorspace dst,
-                    enum tone_mapping algo, float tone_mapping_param,
-                    float tone_mapping_desat, bool detect_peak,
-                    bool gamut_warning, bool is_linear)
+                    const struct gl_tone_map_opts *opts)
 {
     GLSLF("// color mapping\n");
-
-    // Compute the highest encodable level
-    float src_range = mp_trc_nom_peak(src.gamma),
-          dst_range = mp_trc_nom_peak(dst.gamma);
-    float ref_peak = src.sig_peak / dst_range;
 
     // Some operations need access to the video's luma coefficients, so make
     // them available
@@ -699,30 +783,33 @@ void pass_color_map(struct gl_shader_cache *sc,
     mp_get_rgb2xyz_matrix(mp_get_csp_primaries(dst.primaries), rgb2xyz);
     gl_sc_uniform_vec3(sc, "dst_luma", rgb2xyz[1]);
 
+    bool need_ootf = src.light != dst.light;
+    if (src.light == MP_CSP_LIGHT_SCENE_HLG && src.sig_peak != dst.sig_peak)
+        need_ootf = true;
+
     // All operations from here on require linear light as a starting point,
     // so we linearize even if src.gamma == dst.gamma when one of the other
     // operations needs it
-    bool need_gamma = src.gamma != dst.gamma ||
-                      src.primaries != dst.primaries ||
-                      src_range != dst_range ||
-                      src.sig_peak > dst_range ||
-                      src.light != dst.light;
+    bool need_linear = src.gamma != dst.gamma ||
+                       src.primaries != dst.primaries ||
+                       src.sig_peak != dst.sig_peak ||
+                       need_ootf;
 
-    if (need_gamma && !is_linear) {
+    if (need_linear && !is_linear) {
+        // We also pull it up so that 1.0 is the reference white
         pass_linearize(sc, src.gamma);
-        is_linear= true;
+        is_linear = true;
     }
 
-    if (src.light != dst.light)
-        pass_ootf(sc, src.light, mp_trc_nom_peak(src.gamma));
+    // Pre-scale the incoming values into an absolute scale
+    GLSLF("color.rgb *= vec3(%f);\n", mp_trc_nom_peak(src.gamma));
 
-    // Rescale the signal to compensate for differences in the encoding range
-    // and reference white level. This is necessary because of how mpv encodes
-    // brightness in textures.
-    if (src_range != dst_range) {
-        GLSLF("// rescale value range;\n");
-        GLSLF("color.rgb *= vec3(%f);\n", src_range / dst_range);
-    }
+    if (need_ootf)
+        pass_ootf(sc, src.light, src.sig_peak);
+
+    // Tone map to prevent clipping due to excessive brightness
+    if (src.sig_peak > dst.sig_peak)
+        pass_tone_map(sc, src.sig_peak, dst.sig_peak, opts);
 
     // Adapt to the right colorspace if necessary
     if (src.primaries != dst.primaries) {
@@ -732,24 +819,24 @@ void pass_color_map(struct gl_shader_cache *sc,
         mp_get_cms_matrix(csp_src, csp_dst, MP_INTENT_RELATIVE_COLORIMETRIC, m);
         gl_sc_uniform_mat3(sc, "cms_matrix", true, &m[0][0]);
         GLSL(color.rgb = cms_matrix * color.rgb;)
-        // Since this can reduce the gamut, figure out by how much
-        for (int c = 0; c < 3; c++)
-            ref_peak = MPMAX(ref_peak, m[c][c]);
     }
 
-    // Tone map to prevent clipping when the source signal peak exceeds the
-    // encodable range or we've reduced the gamut
-    if (ref_peak > 1) {
-        pass_tone_map(sc, detect_peak ? 0 : ref_peak, algo,
-                      tone_mapping_param, tone_mapping_desat);
-    }
+    if (need_ootf)
+        pass_inverse_ootf(sc, dst.light, dst.sig_peak);
 
-    if (src.light != dst.light)
-        pass_inverse_ootf(sc, dst.light, mp_trc_nom_peak(dst.gamma));
+    // Post-scale the outgoing values from absolute scale to normalized.
+    // For SDR, we normalize to the chosen signal peak. For HDR, we normalize
+    // to the encoding range of the transfer function.
+    float dst_range = dst.sig_peak;
+    if (mp_trc_is_hdr(dst.gamma))
+        dst_range = mp_trc_nom_peak(dst.gamma);
+
+    GLSLF("color.rgb *= vec3(%f);\n", 1.0 / dst_range);
 
     // Warn for remaining out-of-gamut colors is enabled
-    if (gamut_warning) {
-        GLSL(if (any(greaterThan(color.rgb, vec3(1.01)))))
+    if (opts->gamut_warning) {
+        GLSL(if (any(greaterThan(color.rgb, vec3(1.01))) ||
+                 any(lessThan(color.rgb, vec3(0.0)))))
             GLSL(color.rgb = vec3(1.0) - color.rgb;) // invert
     }
 
@@ -760,10 +847,14 @@ void pass_color_map(struct gl_shader_cache *sc,
 // Wide usage friendly PRNG, shamelessly stolen from a GLSL tricks forum post.
 // Obtain random numbers by calling rand(h), followed by h = permute(h) to
 // update the state. Assumes the texture was hooked.
+// permute() was modified from the original to avoid "large" numbers in
+// calculations, since low-end mobile GPUs choke on them (overflow).
 static void prng_init(struct gl_shader_cache *sc, AVLFG *lfg)
 {
     GLSLH(float mod289(float x)  { return x - floor(x * 1.0/289.0) * 289.0; })
-    GLSLH(float permute(float x) { return mod289((34.0*x + 1.0) * x); })
+    GLSLHF("float permute(float x) {\n");
+        GLSLH(return mod289( mod289(34.0*x + 1.0) * (fract(x) + 1.0) );)
+    GLSLHF("}\n");
     GLSLH(float rand(float x)    { return fract(x * 1.0/41.0); })
 
     // Initialize the PRNG by hashing the position + a random uniform

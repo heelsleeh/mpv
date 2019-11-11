@@ -43,10 +43,10 @@ static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 // destructors are thread-safe.)
 
 struct mp_image_pool {
-    int max_count;
-
     struct mp_image **images;
     int num_images;
+
+    int fmt, w, h;
 
     mp_image_allocator allocator;
     void *allocator_ctx;
@@ -70,13 +70,12 @@ static void image_pool_destructor(void *ptr)
     mp_image_pool_clear(pool);
 }
 
-struct mp_image_pool *mp_image_pool_new(int max_count)
+// If tparent!=NULL, set it as talloc parent for the pool.
+struct mp_image_pool *mp_image_pool_new(void *tparent)
 {
-    struct mp_image_pool *pool = talloc_ptrtype(NULL, pool);
+    struct mp_image_pool *pool = talloc_ptrtype(tparent, pool);
     talloc_set_destructor(pool, image_pool_destructor);
-    *pool = (struct mp_image_pool) {
-        .max_count = max_count,
-    };
+    *pool = (struct mp_image_pool) {0};
     return pool;
 }
 
@@ -188,8 +187,11 @@ struct mp_image *mp_image_pool_get(struct mp_image_pool *pool, int fmt,
         return mp_image_alloc(fmt, w, h);
     struct mp_image *new = mp_image_pool_get_no_alloc(pool, fmt, w, h);
     if (!new) {
-        if (pool->num_images >= pool->max_count)
+        if (fmt != pool->fmt || w != pool->w || h != pool->h)
             mp_image_pool_clear(pool);
+        pool->fmt = fmt;
+        pool->w = w;
+        pool->h = h;
         if (pool->allocator) {
             new = pool->allocator(pool->allocator_ctx, fmt, w, h);
         } else {
@@ -251,25 +253,19 @@ void mp_image_pool_set_lru(struct mp_image_pool *pool)
     pool->use_lru = true;
 }
 
-
-// Copies the contents of the HW surface img to system memory and retuns it.
-// If swpool is not NULL, it's used to allocate the target image.
-// img must be a hw surface with a AVHWFramesContext attached.
-// The returned image is cropped as needed.
-// Returns NULL on failure.
-struct mp_image *mp_image_hw_download(struct mp_image *src,
-                                      struct mp_image_pool *swpool)
+// Return the sw image format mp_image_hw_download() would use. This can be
+// different from src->params.hw_subfmt in obscure cases.
+int mp_image_hw_download_get_sw_format(struct mp_image *src)
 {
     if (!src->hwctx)
-        return NULL;
-    AVHWFramesContext *fctx = (void *)src->hwctx->data;
+        return 0;
 
     // Try to find the first format which we can apparently use.
     int imgfmt = 0;
     enum AVPixelFormat *fmts;
     if (av_hwframe_transfer_get_formats(src->hwctx,
             AV_HWFRAME_TRANSFER_DIRECTION_FROM, &fmts, 0) < 0)
-        return NULL;
+        return 0;
     for (int n = 0; fmts[n] != AV_PIX_FMT_NONE; n++) {
         imgfmt = pixfmt2imgfmt(fmts[n]);
         if (imgfmt)
@@ -277,8 +273,23 @@ struct mp_image *mp_image_hw_download(struct mp_image *src,
     }
     av_free(fmts);
 
+    return imgfmt;
+}
+
+// Copies the contents of the HW surface src to system memory and retuns it.
+// If swpool is not NULL, it's used to allocate the target image.
+// src must be a hw surface with a AVHWFramesContext attached.
+// The returned image is cropped as needed.
+// Returns NULL on failure.
+struct mp_image *mp_image_hw_download(struct mp_image *src,
+                                      struct mp_image_pool *swpool)
+{
+    int imgfmt = mp_image_hw_download_get_sw_format(src);
     if (!imgfmt)
         return NULL;
+
+    assert(src->hwctx);
+    AVHWFramesContext *fctx = (void *)src->hwctx->data;
 
     struct mp_image *dst =
         mp_image_pool_get(swpool, imgfmt, fctx->width, fctx->height);
@@ -341,4 +352,77 @@ done:
     if (ok)
         mp_image_copy_attributes(hw_img, src);
     return ok;
+}
+
+bool mp_update_av_hw_frames_pool(struct AVBufferRef **hw_frames_ctx,
+                                 struct AVBufferRef *hw_device_ctx,
+                                 int imgfmt, int sw_imgfmt, int w, int h)
+{
+    enum AVPixelFormat format = imgfmt2pixfmt(imgfmt);
+    enum AVPixelFormat sw_format = imgfmt2pixfmt(sw_imgfmt);
+
+    if (format == AV_PIX_FMT_NONE || sw_format == AV_PIX_FMT_NONE ||
+        !hw_device_ctx || w < 1 || h < 1)
+    {
+        av_buffer_unref(hw_frames_ctx);
+        return false;
+    }
+
+    if (*hw_frames_ctx) {
+        AVHWFramesContext *hw_frames = (void *)(*hw_frames_ctx)->data;
+
+        if (hw_frames->device_ref->data != hw_device_ctx->data ||
+            hw_frames->format != format || hw_frames->sw_format != sw_format ||
+            hw_frames->width != w || hw_frames->height != h)
+            av_buffer_unref(hw_frames_ctx);
+    }
+
+    if (!*hw_frames_ctx) {
+        *hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
+        if (!*hw_frames_ctx)
+            return false;
+
+        AVHWFramesContext *hw_frames = (void *)(*hw_frames_ctx)->data;
+        hw_frames->format = format;
+        hw_frames->sw_format = sw_format;
+        hw_frames->width = w;
+        hw_frames->height = h;
+        if (av_hwframe_ctx_init(*hw_frames_ctx) < 0) {
+            av_buffer_unref(hw_frames_ctx);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+struct mp_image *mp_av_pool_image_hw_upload(struct AVBufferRef *hw_frames_ctx,
+                                            struct mp_image *src)
+{
+    AVFrame *av_frame = av_frame_alloc();
+    if (!av_frame)
+        return NULL;
+    if (av_hwframe_get_buffer(hw_frames_ctx, av_frame, 0) < 0) {
+        av_frame_free(&av_frame);
+        return NULL;
+    }
+    struct mp_image *dst = mp_image_from_av_frame(av_frame);
+    av_frame_free(&av_frame);
+    if (!dst)
+        return NULL;
+
+    if (dst->w < src->w || dst->h < src->h) {
+        talloc_free(dst);
+        return NULL;
+    }
+
+    mp_image_set_size(dst, src->w, src->h);
+
+    if (!mp_image_hw_upload(dst, src)) {
+        talloc_free(dst);
+        return NULL;
+    }
+
+    mp_image_copy_attributes(dst, src);
+    return dst;
 }

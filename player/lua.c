@@ -44,6 +44,7 @@
 #include "osdep/subprocess.h"
 #include "osdep/timer.h"
 #include "osdep/threads.h"
+#include "osdep/getpid.h"
 #include "stream/stream.h"
 #include "sub/osd.h"
 #include "core.h"
@@ -555,6 +556,18 @@ static int script_wait_event(lua_State *L)
         lua_setfield(L, -2, "data");
         break;
     }
+    case MPV_EVENT_HOOK: {
+        mpv_event_hook *hook = event->data;
+        lua_pushinteger(L, hook->id);
+        lua_setfield(L, -2, "hook_id");
+        break;
+    }
+    case MPV_EVENT_COMMAND_REPLY: {
+        mpv_event_command *cmd = event->data;
+        pushnode(L, &cmd->result);
+        lua_setfield(L, -2, "result");
+        break;
+    }
     default: ;
     }
 
@@ -960,6 +973,26 @@ static int script_command_native(lua_State *L)
     return 2;
 }
 
+static int script_raw_command_native_async(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    uint64_t id = luaL_checknumber(L, 1);
+    struct mpv_node node;
+    void *tmp = mp_lua_PITA(L);
+    makenode(tmp, &node, L, 2);
+    int res = mpv_command_node_async(ctx->client, id, &node);
+    talloc_free_children(tmp);
+    return check_error(L, res);
+}
+
+static int script_raw_abort_async_command(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    uint64_t id = luaL_checknumber(L, 1);
+    mpv_abort_async_command(ctx->client, id);
+    return 0;
+}
+
 static int script_set_osd_ass(lua_State *L)
 {
     struct script_ctx *ctx = get_ctx(L);
@@ -1043,6 +1076,22 @@ static int script_get_wakeup_pipe(lua_State *L)
     struct script_ctx *ctx = get_ctx(L);
     lua_pushinteger(L, mpv_get_wakeup_pipe(ctx->client));
     return 1;
+}
+
+static int script_raw_hook_add(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    uint64_t ud = luaL_checkinteger(L, 1);
+    const char *name = luaL_checkstring(L, 2);
+    int pri = luaL_checkinteger(L, 3);
+    return check_error(L, mpv_hook_add(ctx->client, ud, name, pri));
+}
+
+static int script_raw_hook_continue(lua_State *L)
+{
+    struct script_ctx *ctx = get_ctx(L);
+    lua_Integer id = luaL_checkinteger(L, 1);
+    return check_error(L, mpv_hook_continue(ctx->client, id));
 }
 
 static int script_readdir(lua_State *L)
@@ -1146,109 +1195,9 @@ static int script_join_path(lua_State *L)
     return 1;
 }
 
-struct subprocess_cb_ctx {
-    struct mp_log *log;
-    void* talloc_ctx;
-    int64_t max_size;
-    bstr output;
-};
-
-static void subprocess_stdout(void *p, char *data, size_t size)
+static int script_getpid(lua_State *L)
 {
-    struct subprocess_cb_ctx *ctx = p;
-    if (ctx->output.len < ctx->max_size)
-        bstr_xappend(ctx->talloc_ctx, &ctx->output, (bstr){data, size});
-}
-
-static void subprocess_stderr(void *p, char *data, size_t size)
-{
-    struct subprocess_cb_ctx *ctx = p;
-    MP_INFO(ctx, "%.*s", (int)size, data);
-}
-
-static int script_subprocess(lua_State *L)
-{
-    struct script_ctx *ctx = get_ctx(L);
-    luaL_checktype(L, 1, LUA_TTABLE);
-    void *tmp = mp_lua_PITA(L);
-
-    lua_getfield(L, 1, "args"); // args
-    int num_args = mp_lua_len(L, -1);
-    char *args[256];
-    if (num_args > MP_ARRAY_SIZE(args) - 1) // last needs to be NULL
-        luaL_error(L, "too many arguments");
-    if (num_args < 1)
-        luaL_error(L, "program name missing");
-    for (int n = 0; n < num_args; n++) {
-        lua_pushinteger(L, n + 1); // args n
-        lua_gettable(L, -2); // args arg
-        args[n] = talloc_strdup(tmp, lua_tostring(L, -1));
-        if (!args[n])
-            luaL_error(L, "program arguments must be strings");
-        lua_pop(L, 1); // args
-    }
-    args[num_args] = NULL;
-    lua_pop(L, 1); // -
-
-    lua_getfield(L, 1, "cancellable"); // c
-    struct mp_cancel *cancel = NULL;
-    if (lua_isnil(L, -1) ? true : lua_toboolean(L, -1))
-        cancel = ctx->mpctx->playback_abort;
-    lua_pop(L, 1); // -
-
-    lua_getfield(L, 1, "max_size"); // m
-    int64_t max_size = lua_isnil(L, -1) ? 64 * 1024 * 1024 : lua_tointeger(L, -1);
-
-    struct subprocess_cb_ctx cb_ctx = {
-        .log = ctx->log,
-        .talloc_ctx = tmp,
-        .max_size = max_size,
-    };
-
-    char *error = NULL;
-    int status = mp_subprocess(args, cancel, &cb_ctx, subprocess_stdout,
-                               subprocess_stderr, &error);
-
-    lua_newtable(L); // res
-    if (error) {
-        lua_pushstring(L, error); // res e
-        lua_setfield(L, -2, "error"); // res
-    }
-    lua_pushinteger(L, status); // res s
-    lua_setfield(L, -2, "status"); // res
-    lua_pushlstring(L, cb_ctx.output.start, cb_ctx.output.len); // res d
-    lua_setfield(L, -2, "stdout"); // res
-    lua_pushboolean(L, status == MP_SUBPROCESS_EKILLED_BY_US); // res b
-    lua_setfield(L, -2, "killed_by_us"); // res
-    return 1;
-}
-
-static int script_subprocess_detached(lua_State *L)
-{
-    struct script_ctx *ctx = get_ctx(L);
-    luaL_checktype(L, 1, LUA_TTABLE);
-    void *tmp = mp_lua_PITA(L);
-
-    lua_getfield(L, 1, "args"); // args
-    int num_args = mp_lua_len(L, -1);
-    char *args[256];
-    if (num_args > MP_ARRAY_SIZE(args) - 1) // last needs to be NULL
-        luaL_error(L, "too many arguments");
-    if (num_args < 1)
-        luaL_error(L, "program name missing");
-    for (int n = 0; n < num_args; n++) {
-        lua_pushinteger(L, n + 1); // args n
-        lua_gettable(L, -2); // args arg
-        args[n] = talloc_strdup(tmp, lua_tostring(L, -1));
-        if (!args[n])
-            luaL_error(L, "program arguments must be strings");
-        lua_pop(L, 1); // args
-    }
-    args[num_args] = NULL;
-    lua_pop(L, 1); // -
-
-    mp_subprocess_detached(ctx->log, args);
-    lua_pushnil(L);
+    lua_pushnumber(L, mp_getpid());
     return 1;
 }
 
@@ -1310,6 +1259,8 @@ static const struct fn_entry main_fns[] = {
     FN_ENTRY(command),
     FN_ENTRY(commandv),
     FN_ENTRY(command_native),
+    FN_ENTRY(raw_command_native_async),
+    FN_ENTRY(raw_abort_async_command),
     FN_ENTRY(get_property_bool),
     FN_ENTRY(get_property_number),
     FN_ENTRY(get_property_native),
@@ -1328,6 +1279,8 @@ static const struct fn_entry main_fns[] = {
     FN_ENTRY(format_time),
     FN_ENTRY(enable_messages),
     FN_ENTRY(get_wakeup_pipe),
+    FN_ENTRY(raw_hook_add),
+    FN_ENTRY(raw_hook_continue),
     {0}
 };
 
@@ -1336,8 +1289,7 @@ static const struct fn_entry utils_fns[] = {
     FN_ENTRY(file_info),
     FN_ENTRY(split_path),
     FN_ENTRY(join_path),
-    FN_ENTRY(subprocess),
-    FN_ENTRY(subprocess_detached),
+    FN_ENTRY(getpid),
     FN_ENTRY(parse_json),
     FN_ENTRY(format_json),
     {0}

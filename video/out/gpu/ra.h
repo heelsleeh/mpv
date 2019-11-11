@@ -39,7 +39,28 @@ struct ra {
     // RA_CAP_DIRECT_UPLOAD is supported. This is basically only relevant for
     // OpenGL. Set by the RA user.
     bool use_pbo;
+
+    // Array of native resources. For the most part an "escape" mechanism, and
+    // usually does not contain parameters required for basic functionality.
+    struct ra_native_resource *native_resources;
+    int num_native_resources;
 };
+
+// For passing through windowing system specific parameters and such. The
+// names are always internal (except for legacy opengl-cb uses; the libmpv
+// render API uses mpv_render_param_type and maps them to names internally).
+// For example, a name="x11" entry has a X11 display as (Display*)data.
+struct ra_native_resource {
+    const char *name;
+    void *data;
+};
+
+// Add a ra_native_resource entry. Both name and data pointers must stay valid
+// until ra termination.
+void ra_add_native_resource(struct ra *ra, const char *name, void *data);
+
+// Search ra->native_resources, returns NULL on failure.
+void *ra_get_native_resource(struct ra *ra, const char *name);
 
 enum {
     RA_CAP_TEX_1D         = 1 << 0, // supports 1D textures (as shader inputs)
@@ -54,6 +75,7 @@ enum {
     RA_CAP_GATHER         = 1 << 9, // supports textureGather in GLSL
     RA_CAP_FRAGCOORD      = 1 << 10, // supports reading from gl_FragCoord
     RA_CAP_PARALLEL_COMPUTE  = 1 << 11, // supports parallel compute shaders
+    RA_CAP_NUM_GROUPS     = 1 << 12, // supports gl_NumWorkGroups
 };
 
 enum ra_ctype {
@@ -85,6 +107,7 @@ struct ra_format {
                             // only applies to 2-component textures
     bool linear_filter;     // linear filtering available from shader
     bool renderable;        // can be used for render targets
+    bool storable;          // can be used for storage images
     bool dummy_format;      // is not a real ra_format but a fake one (e.g. FBO).
                             // dummy formats cannot be used to create textures
 
@@ -109,6 +132,7 @@ struct ra_tex_params {
     bool blit_src;          // must be usable as a blit source
     bool blit_dst;          // must be usable as a blit destination
     bool host_mutable;      // texture may be updated with tex_upload
+    bool downloadable;      // texture can be read with tex_download
     // When used as render source texture.
     bool src_linear;        // if false, use nearest sampling (whether this can
                             // be true depends on ra_format.linear_filter)
@@ -150,6 +174,13 @@ struct ra_tex_upload_params {
     ptrdiff_t stride;   // The size of a horizontal line in bytes (*not* texels!)
 };
 
+struct ra_tex_download_params {
+    struct ra_tex *tex; // Texture to download from
+    // Downloading directly (set by caller, data written to by callee):
+    void *dst;          // Address of data (packed with no alignment)
+    ptrdiff_t stride;   // The size of a horizontal line in bytes (*not* texels!)
+};
+
 // Buffer usage type. This restricts what types of operations may be performed
 // on a buffer.
 enum ra_buf_type {
@@ -158,6 +189,7 @@ enum ra_buf_type {
     RA_BUF_TYPE_SHADER_STORAGE, // shader buffer (SSBO), for RA_VARTYPE_BUF_RW
     RA_BUF_TYPE_UNIFORM,        // uniform buffer (UBO), for RA_VARTYPE_BUF_RO
     RA_BUF_TYPE_VERTEX,         // not publicly usable (RA-internal usage)
+    RA_BUF_TYPE_SHARED_MEMORY,  // device memory for sharing with external API
 };
 
 struct ra_buf_params {
@@ -378,6 +410,10 @@ struct ra_fns {
     // Returns whether successful.
     bool (*tex_upload)(struct ra *ra, const struct ra_tex_upload_params *params);
 
+    // Copy data from the texture to memory. ra_tex_params.downloadable must
+    // have been set to true on texture creation.
+    bool (*tex_download)(struct ra *ra, struct ra_tex_download_params *params);
+
     // Create a buffer. This can be used as a persistently mapped buffer,
     // a uniform buffer, a shader storage buffer or possibly others.
     // Not all usage types must be supported; may return NULL if unavailable.
@@ -410,7 +446,7 @@ struct ra_fns {
     // Returns an abstract namespace index for a given renderpass input type.
     // This will always be a value >= 0 and < RA_VARTYPE_COUNT. This is used to
     // figure out which inputs may share the same value of `binding`.
-    int (*desc_namespace)(enum ra_vartype type);
+    int (*desc_namespace)(struct ra *ra, enum ra_vartype type);
 
     // Clear the dst with the given color (rgba) and within the given scissor.
     // dst must have dst->params.render_dst==true. Content outside of the

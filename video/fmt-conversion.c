@@ -35,6 +35,9 @@ static const struct {
     {IMGFMT_RGB24, AV_PIX_FMT_RGB24},
     {IMGFMT_UYVY,  AV_PIX_FMT_UYVY422},
     {IMGFMT_NV12,  AV_PIX_FMT_NV12},
+#if LIBAVUTIL_VERSION_MICRO >= 100 && LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 27, 0)
+    {IMGFMT_NV24,  AV_PIX_FMT_NV24},
+#endif
     {IMGFMT_Y8,    AV_PIX_FMT_GRAY8},
     {IMGFMT_Y16, AV_PIX_FMT_GRAY16},
     {IMGFMT_420P,  AV_PIX_FMT_YUV420P},
@@ -57,6 +60,8 @@ static const struct {
     {IMGFMT_0BGR,  AV_PIX_FMT_ABGR},
 #endif
 
+    {IMGFMT_RGBA64, AV_PIX_FMT_RGBA64},
+
     {IMGFMT_VDPAU, AV_PIX_FMT_VDPAU},
 #if HAVE_VIDEOTOOLBOX_HWACCEL
     {IMGFMT_VIDEOTOOLBOX,   AV_PIX_FMT_VIDEOTOOLBOX},
@@ -67,8 +72,7 @@ static const struct {
     {IMGFMT_VAAPI, AV_PIX_FMT_VAAPI},
     {IMGFMT_DXVA2, AV_PIX_FMT_DXVA2_VLD},
 #if HAVE_D3D_HWACCEL
-    {IMGFMT_D3D11VA, AV_PIX_FMT_D3D11},
-    {IMGFMT_D3D11NV12, AV_PIX_FMT_D3D11},
+    {IMGFMT_D3D11, AV_PIX_FMT_D3D11},
 #endif
     {IMGFMT_MMAL, AV_PIX_FMT_MMAL},
 #if HAVE_CUDA_HWACCEL
@@ -91,7 +95,7 @@ enum AVPixelFormat imgfmt2pixfmt(int fmt)
         enum AVPixelFormat pixfmt = fmt - IMGFMT_AVPIXFMT_START;
         // Avoid duplicate format - each format must be unique.
         int mpfmt = pixfmt2imgfmt(pixfmt);
-        if (mpfmt == fmt)
+        if (mpfmt == fmt && av_pix_fmt_desc_get(pixfmt))
             return pixfmt;
         return AV_PIX_FMT_NONE;
     }
@@ -114,7 +118,7 @@ int pixfmt2imgfmt(enum AVPixelFormat pix_fmt)
     }
 
     int generic = IMGFMT_AVPIXFMT_START + pix_fmt;
-    if (generic < IMGFMT_AVPIXFMT_END)
+    if (generic < IMGFMT_AVPIXFMT_END && av_pix_fmt_desc_get(pix_fmt))
         return generic;
 
     return 0;

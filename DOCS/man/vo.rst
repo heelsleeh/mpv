@@ -71,6 +71,9 @@ Available video output drivers are:
     Shared memory video output driver without hardware acceleration that works
     whenever X11 is present.
 
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
+
     .. note:: This is a fallback only, and should not be normally used.
 
 ``vdpau`` (X11 only)
@@ -308,7 +311,7 @@ Available video output drivers are:
     For tuning, refer to your copy of the file ``SDL_hints.h``.
 
     .. note:: This driver is for compatibility with systems that don't provide
-              proper graphics drivers, or which support GLES only.
+              proper graphics drivers.
 
     The following global options are supported by this video output:
 
@@ -324,7 +327,7 @@ Available video output drivers are:
     This is low quality, and has issues with OSD.
 
     .. note:: This driver is for compatibility with crappy systems. You can
-              use vaapi hardware decoding with ``--vo=opengl`` too.
+              use vaapi hardware decoding with ``--vo=gpu`` too.
 
     The following global options are supported by this video output:
 
@@ -383,6 +386,9 @@ Available video output drivers are:
     Depends on support of true color by modern terminals to display the images
     at full color range. On Windows it requires an ansi terminal such as mintty.
 
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
+
     ``--vo-tct-algo=<algo>``
         Select how to write the pixels to the terminal.
 
@@ -415,6 +421,8 @@ Available video output drivers are:
             JPEG files, extension .jpeg.
         png
             PNG files.
+        webp
+            WebP files.
 
     ``--vo-image-png-compression=<0-9>``
         PNG compression factor (speed vs. file size tradeoff) (default: 7)
@@ -425,40 +433,30 @@ Available video output drivers are:
         JPEG quality factor (default: 90)
     ``--vo-image-jpeg-optimize=<0-100>``
         JPEG optimization factor (default: 100)
+    ``--vo-image-webp-lossless=<yes|no>``
+        Enable writing lossless WebP files (default: no)
+    ``--vo-image-webp-quality=<0-100>``
+        WebP quality (default: 75)
+    ``--vo-image-webp-compression=<0-6>``
+        WebP compression factor (default: 4)
     ``--vo-image-outdir=<dirname>``
         Specify the directory to save the image files to (default: ``./``).
 
-``wayland`` (Wayland only)
-    Wayland shared memory video output as fallback for ``opengl``.
+``libmpv``
+    For use with libmpv direct embedding. As a special case, on OS X it
+    is used like a normal VO within mpv (cocoa-cb). Otherwise useless in any
+    other contexts.
+    (See ``<mpv/render.h>``.)
 
-    .. note:: This driver is for compatibility with systems that don't provide
-              working OpenGL drivers.
-
-    The following global options are supported by this video output:
-
-    ``--vo-wayland-alpha``
-        Use a buffer format that supports videos and images with alpha
-        information
-    ``--vo-wayland-rgb565``
-        Use RGB565 as buffer format. This format is implemented on most
-        platforms, especially on embedded where it is far more efficient then
-        RGB8888.
-    ``--vo-wayland-triple-buffering``
-        Use 3 buffers instead of 2. This can lead to more fluid playback, but
-        uses more memory.
-
-``opengl-cb``
-    For use with libmpv direct OpenGL embedding; useless in any other contexts.
-    (See ``<mpv/opengl_cb.h>``.)
-
-    This also supports many of the options the ``opengl`` VO has.
+    This also supports many of the options the ``gpu`` VO has, depending on the
+    backend.
 
 ``rpi`` (Raspberry Pi)
     Native video output on the Raspberry Pi using the MMAL API.
 
-    This is deprecated. Use ``--vo=opengl`` instead, which is the default and
+    This is deprecated. Use ``--vo=gpu`` instead, which is the default and
     provides the same functionality. The ``rpi`` VO will be removed in
-    mpv 0.23.0. Its functionality was folded into --vo=opengl, which now uses
+    mpv 0.23.0. Its functionality was folded into --vo=gpu, which now uses
     RPI hardware decoding by treating it as a hardware overlay (without applying
     GL filtering). Also to be changed in 0.23.0: the --fs flag will be reset to
     "no" by default (like on the other platforms).
@@ -488,26 +486,95 @@ Available video output drivers are:
     Video output driver using Kernel Mode Setting / Direct Rendering Manager.
     Should be used when one doesn't want to install full-blown graphical
     environment (e.g. no X). Does not support hardware acceleration (if you
-    need this, check the ``drm`` backend for ``opengl`` VO).
+    need this, check the ``drm`` backend for ``gpu`` VO).
+
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
 
     The following global options are supported by this video output:
 
     ``--drm-connector=[<gpu_number>.]<name>``
         Select the connector to use (usually this is a monitor.) If ``<name>``
         is empty or ``auto``, mpv renders the output on the first available
-        connector. Use ``--drm-connector=help`` to get list of available
+        connector. Use ``--drm-connector=help`` to get a list of available
         connectors. When using multiple graphic cards, use the ``<gpu_number>``
         argument to disambiguate.
         (default: empty)
 
-    ``--drm-mode=<number>``
-        Mode ID to use (resolution, bit depth and frame rate).
-        (default: 0)
+    ``--drm-mode=<preferred|highest|N|WxH[@R]>``
+        Mode to use (resolution and frame rate).
+        Possible values:
 
-    ``--drm-overlay=<number>``
-        Select the DRM overlay index to use.
-        Overlay index is zero based, and related to crtc.
-        (default: 0)
+        :preferred: Use the preferred mode for the screen on the selected
+                    connector. (default)
+        :highest:   Use the mode with the highest resolution available on the
+                    selected connector.
+        :N:         Select mode by index.
+        :WxH[@R]:   Specify mode by width, height, and optionally refresh rate.
+                    In case several modes match, selects the mode that comes
+                    first in the EDID list of modes.
+
+        Use ``--drm-mode=help`` to get a list of available modes for all active
+        connectors.
+
+    ``--drm-atomic=<no|auto>``
+        Toggle use of atomic modesetting. Mostly useful for debugging.
+
+        :no:    Use legacy modesetting.
+        :auto:  Use atomic modesetting, falling back to legacy modesetting if
+                not available. (default)
+
+        Note: Only affects ``gpu-context=drm``. ``vo=drm`` supports legacy
+        modesetting only.
+
+    ``--drm-draw-plane=<primary|overlay|N>``
+        Select the DRM plane to which video and OSD is drawn to, under normal
+        circumstances. The plane can be specified as ``primary``, which will
+        pick the first applicable primary plane; ``overlay``, which will pick
+        the first applicable overlay plane; or by index. The index is zero
+        based, and related to the CRTC.
+        (default: primary)
+
+        When using this option with the drmprime-drm hwdec interop, only the OSD
+        is rendered to this plane.
+
+    ``--drm-drmprime-video-plane=<primary|overlay|N>``
+        Select the DRM plane to use for video with the drmprime-drm hwdec
+        interop (used by e.g. the rkmpp hwdec on RockChip SoCs, and v4l2 hwdec:s
+        on various other SoC:s). The plane is unused otherwise. This option
+        accepts the same values as ``--drm-draw-plane``. (default: overlay)
+
+        To be able to successfully play 4K video on various SoCs you might need
+        to set ``--drm-draw-plane=overlay --drm-drmprime-video-plane=primary``
+        and setting ``--drm-draw-surface-size=1920x1080``, to render the OSD at a
+        lower resolution (the video when handled by the hwdec will be on the
+        drmprime-video plane and at full 4K resolution)
+
+    ``--drm-format=<xrgb8888|xrgb2101010>``
+        Select the DRM format to use (default: xrgb8888). This allows you to
+        choose the bit depth of the DRM mode. xrgb8888 is your usual 24 bit per
+        pixel/8 bits per channel packed RGB format with 8 bits of padding.
+        xrgb2101010 is a packed 30 bits per pixel/10 bits per channel packed RGB
+        format with 2 bits of padding.
+
+        There are cases when xrgb2101010 will work with the ``drm`` VO, but not
+        with the ``drm`` backend for the ``gpu`` VO. This is because with the
+        ``gpu`` VO, in addition to requiring support in your DRM driver,
+        requires support for xrgb2101010 in your EGL driver
+
+    ``--drm-draw-surface-size=<[WxH]>``
+        Sets the size of the surface used on the draw plane. The surface will
+        then be upscaled to the current screen resolution. This option can be
+        useful when used together with the drmprime-drm hwdec interop at high
+        resolutions, as it allows scaling the draw plane (which in this case
+        only handles the OSD) down to a size the GPU can handle.
+
+        When used without the drmprime-drm hwdec interop this option will just
+        cause the video to get rendered at a different resolution and then
+        scaled to screen size.
+
+        Note: this option is only available with DRM atomic support.
+        (default: display resolution)
 
 ``mediacodec_embed`` (Android)
     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
@@ -518,5 +585,14 @@ Available video output drivers are:
     many of mpv's features (subtitle rendering, OSD/OSC, video filters, etc)
     are not available with this driver.
 
-    To use hardware decoding with ``--vo-gpu`` instead, use
+    To use hardware decoding with ``--vo=gpu`` instead, use
     ``--hwdec=mediacodec-copy`` along with ``--gpu-context=android``.
+
+``wlshm`` (Wayland only)
+    Shared memory video output driver without hardware acceleration that works
+    whenever Wayland is present.
+
+    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
+    performance.
+
+    .. note:: This is a fallback only, and should not be normally used.

@@ -101,6 +101,7 @@ static int ra_init_gl(struct ra *ra, GL *gl)
         {RA_CAP_TEX_1D,             MPGL_CAP_1D_TEX},
         {RA_CAP_TEX_3D,             MPGL_CAP_3D_TEX},
         {RA_CAP_COMPUTE,            MPGL_CAP_COMPUTE_SHADER},
+        {RA_CAP_NUM_GROUPS,         MPGL_CAP_COMPUTE_SHADER},
         {RA_CAP_NESTED_ARRAY,       MPGL_CAP_NESTED_ARRAY},
     };
 
@@ -123,6 +124,12 @@ static int ra_init_gl(struct ra *ra, GL *gl)
     if (gl->BlitFramebuffer)
         ra->caps |= RA_CAP_BLIT;
 
+    // Disable compute shaders for GLSL < 420. This work-around is needed since
+    // some buggy OpenGL drivers expose compute shaders for lower GLSL versions,
+    // despite the spec requiring 420+.
+    if (ra->glsl_version < 420)
+        ra->caps &= ~RA_CAP_COMPUTE;
+
     int gl_fmt_features = gl_format_feature_flags(gl);
 
     for (int n = 0; gl_formats[n].internal_format; n++) {
@@ -143,6 +150,9 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             .linear_filter  = gl_fmt->flags & F_TF,
             .renderable     = (gl_fmt->flags & F_CR) &&
                               (gl->mpgl_caps & MPGL_CAP_FB),
+            // TODO: Check whether it's a storable format
+            // https://www.khronos.org/opengl/wiki/Image_Load_Store
+            .storable       = true,
         };
 
         int csize = gl_component_size(gl_fmt->type) * 8;
@@ -166,6 +176,17 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             fmt->special_imgfmt = IMGFMT_RGB565;
             struct ra_imgfmt_desc *desc = talloc_zero(fmt, struct ra_imgfmt_desc);
             fmt->special_imgfmt_desc = desc;
+            desc->num_planes = 1;
+            desc->planes[0] = fmt;
+            for (int i = 0; i < 3; i++)
+                desc->components[0][i] = i + 1;
+            desc->chroma_w = desc->chroma_h = 1;
+        }
+        if (strcmp(fmt->name, "rgb10_a2") == 0) {
+            fmt->special_imgfmt = IMGFMT_RGB30;
+            struct ra_imgfmt_desc *desc = talloc_zero(fmt, struct ra_imgfmt_desc);
+            fmt->special_imgfmt_desc = desc;
+            desc->component_bits = 10;
             desc->num_planes = 1;
             desc->planes[0] = fmt;
             for (int i = 0; i < 3; i++)
@@ -276,6 +297,13 @@ static struct ra_tex *gl_tex_create_blank(struct ra *ra,
         tex_gl->target = GL_TEXTURE_EXTERNAL_OES;
     }
 
+    if (params->downloadable && !(params->dimensions == 2 &&
+                                  params->format->renderable))
+    {
+        gl_tex_destroy(ra, tex);
+        return NULL;
+    }
+
     return tex;
 }
 
@@ -328,8 +356,11 @@ static struct ra_tex *gl_tex_create(struct ra *ra,
 
     gl_check_error(gl, ra->log, "after creating texture");
 
-    // Even blitting needs an FBO in OpenGL for strange reasons
-    if (tex->params.render_dst || tex->params.blit_src || tex->params.blit_dst) {
+    // Even blitting needs an FBO in OpenGL for strange reasons.
+    // Download is handled by reading from an FBO.
+    if (tex->params.render_dst || tex->params.blit_src ||
+        tex->params.blit_dst || tex->params.downloadable)
+    {
         if (!tex->params.format->renderable) {
             MP_ERR(ra, "Trying to create renderable texture with unsupported "
                    "format.\n");
@@ -511,6 +542,18 @@ static bool gl_tex_upload(struct ra *ra,
     return true;
 }
 
+static bool gl_tex_download(struct ra *ra, struct ra_tex_download_params *params)
+{
+    GL *gl = ra_gl_get(ra);
+    struct ra_tex *tex = params->tex;
+    struct ra_tex_gl *tex_gl = tex->priv;
+    if (!tex_gl->fbo)
+        return false;
+    return gl_read_fbo_contents(gl, tex_gl->fbo, 1, tex_gl->format, tex_gl->type,
+                                tex->params.w, tex->params.h, params->dst,
+                                params->stride);
+}
+
 static void gl_buf_destroy(struct ra *ra, struct ra_buf *buf)
 {
     if (!buf)
@@ -519,7 +562,9 @@ static void gl_buf_destroy(struct ra *ra, struct ra_buf *buf)
     GL *gl = ra_gl_get(ra);
     struct ra_buf_gl *buf_gl = buf->priv;
 
-    gl->DeleteSync(buf_gl->fence);
+    if (buf_gl->fence)
+        gl->DeleteSync(buf_gl->fence);
+
     if (buf->data) {
         gl->BindBuffer(buf_gl->target, buf_gl->buffer);
         gl->UnmapBuffer(buf_gl->target);
@@ -662,7 +707,7 @@ static void gl_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 }
 
-static int gl_desc_namespace(enum ra_vartype type)
+static int gl_desc_namespace(struct ra *ra, enum ra_vartype type)
 {
     return type;
 }
@@ -1133,6 +1178,7 @@ static struct ra_fns ra_fns_gl = {
     .tex_create             = gl_tex_create,
     .tex_destroy            = gl_tex_destroy,
     .tex_upload             = gl_tex_upload,
+    .tex_download           = gl_tex_download,
     .buf_create             = gl_buf_create,
     .buf_destroy            = gl_buf_destroy,
     .buf_update             = gl_buf_update,

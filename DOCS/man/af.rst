@@ -5,7 +5,8 @@ Audio filters allow you to modify the audio stream and its properties. The
 syntax is:
 
 ``--af=...``
-    Setup a chain of audio filters. See ``--vf`` for the syntax.
+    Setup a chain of audio filters. See ``--vf`` (`VIDEO FILTERS`_) for the
+    full syntax.
 
 .. note::
 
@@ -22,37 +23,6 @@ See ``--vf`` group of options for info on how ``--af-defaults``, ``--af-add``,
 ``--af-pre``, ``--af-del``, ``--af-clr``, and possibly others work.
 
 Available filters are:
-
-``lavrresample[=option1:option2:...]``
-    This filter uses libavresample (or libswresample, depending on the build)
-    to change sample rate, sample format, or channel layout of the audio stream.
-    This filter is automatically enabled if the audio output does not support
-    the audio configuration of the file being played.
-
-    It supports only the following sample formats: u8, s16, s32, float.
-
-    ``filter-size=<length>``
-        Length of the filter with respect to the lower sampling rate. (default:
-        16)
-    ``phase-shift=<count>``
-        Log2 of the number of polyphase entries. (..., 10->1024, 11->2048,
-        12->4096, ...) (default: 10->1024)
-    ``cutoff=<cutoff>``
-        Cutoff frequency (0.0-1.0), default set depending upon filter length.
-    ``linear``
-        If set then filters will be linearly interpolated between polyphase
-        entries. (default: no)
-    ``no-detach``
-        Do not detach if input and output audio format/rate/channels match.
-        (If you just want to set defaults for this filter that will be used
-        even by automatically inserted lavrresample instances, you should
-        prefer setting them with ``--af-defaults=lavrresample:...``.)
-    ``normalize=<yes|no|auto>``
-        Whether to normalize when remixing channel layouts (default: auto).
-        ``auto`` uses the value set by ``--audio-normalize-downmix``.
-    ``o=<string>``
-        Set AVOptions on the SwrContext or AVAudioResampleContext. These should
-        be documented by FFmpeg or Libav.
 
 ``lavcac3enc[=options]``
     Encode multi-channel audio to AC-3 at runtime using libavcodec. Supports
@@ -91,7 +61,7 @@ Available filters are:
         Select the libavcodec encoder used. Currently, this should be an AC-3
         encoder, and using another codec will fail horribly.
 
-``format=format:srate:channels:out-format:out-srate:out-channels``
+``format=format:srate:channels:out-srate:out-channels``
     Does not do any format conversion itself. Rather, it may cause the
     filter system to insert necessary conversion filters before or after this
     filter if needed. It is primarily useful for controlling the audio format
@@ -119,8 +89,6 @@ Available filters are:
     ``<channels>``
         Force mixing to a specific channel layout. See ``--audio-channels`` option
         for possible values.
-
-    ``<out-format>``
 
     ``<out-srate>``
 
@@ -219,6 +187,12 @@ Available filters are:
         change the playback pitch at runtime. Note that speed is controlled
         using the standard ``speed`` property, not ``af-command``.
 
+    ``multiply-pitch <factor>``
+        Multiply the current value of ``<pitch-scale>`` dynamically.  For
+        example: 0.5 to go down by an octave, 1.5 to go up by a perfect fifth.
+        If you want to go up or down by semi-tones, use 1.059463094352953 and
+        0.9438743126816935
+
 ``lavfi=graph``
     Filter audio using FFmpeg's libavfilter.
 
@@ -233,3 +207,16 @@ Available filters are:
 
     ``o=<string>``
         AVOptions.
+
+    ``fix-pts=<yes|no>``
+        Determine PTS based on sample count (default: no). If this is enabled,
+        the player won't rely on libavfilter passing through PTS accurately.
+        Instead, it pass a sample count as PTS to libavfilter, and compute the
+        PTS used by mpv based on that and the input PTS. This helps with filters
+        which output a recomputed PTS instead of the original PTS (including
+        filters which require the PTS to start at 0). mpv normally expects
+        filters to not touch the PTS (or only to the extent of changing frame
+        boundaries), so this is not the default, but it will be needed to use
+        broken filters. In practice, these broken filters will either cause slow
+        A/V desync over time (with some files), or break playback completely if
+        you seek or start playback from the middle of a file.

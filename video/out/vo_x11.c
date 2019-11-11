@@ -28,7 +28,6 @@
 #include "vo.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
-#include "video/filter/vf.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -227,7 +226,7 @@ static bool resize(struct vo *vo)
 
     for (int i = 0; i < 2; i++) {
         if (!getMyXImage(p, i))
-            return -1;
+            return false;
     }
 
     const struct fmt_entry *fmte = mp_to_x_fmt;
@@ -242,10 +241,9 @@ static bool resize(struct vo *vo)
     }
     if (!fmte->mpfmt) {
         MP_ERR(vo, "X server image format not supported, use another VO.\n");
-        return -1;
+        return false;
     }
 
-    mp_sws_set_from_cmdline(p->sws, vo->opts->sws_opts);
     p->sws->dst = (struct mp_image_params) {
         .imgfmt = fmte->mpfmt,
         .w = p->dst_w,
@@ -352,7 +350,8 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
 
 static int query_format(struct vo *vo, int format)
 {
-    if (sws_isSupportedInput(imgfmt2pixfmt(format)))
+    struct priv *p = vo->priv;
+    if (mp_sws_supports_formats(p->sws, IMGFMT_RGB0, format))
         return 1;
     return 0;
 }
@@ -377,6 +376,8 @@ static int preinit(struct vo *vo)
     struct priv *p = vo->priv;
     p->vo = vo;
     p->sws = mp_sws_alloc(vo);
+    p->sws->log = vo->log;
+    mp_sws_enable_cmdline_opts(p->sws, vo->global);
 
     if (!vo_x11_init(vo))
         goto error;

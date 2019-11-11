@@ -31,8 +31,6 @@
 #include <limits.h>
 #include <assert.h>
 
-#include <libavutil/common.h>
-
 #include "config.h"
 #include "video/vdpau.h"
 #include "video/vdpau_mixer.h"
@@ -86,6 +84,7 @@ struct vdpctx {
     int                                current_duration;
 
     int                                output_surface_w, output_surface_h;
+    int                                rotation;
 
     int                                force_yuv;
     struct mp_vdpau_mixer             *video_mixer;
@@ -244,8 +243,7 @@ static void forget_frames(struct vo *vo, bool seek_reset)
 static int s_size(int max, int s, int disp)
 {
     disp = MPMAX(1, disp);
-    s += s / 2;
-    return MPMIN(max, s >= disp ? s : disp);
+    return MPMIN(max, MPMAX(s, disp));
 }
 
 static void resize(struct vo *vo)
@@ -285,7 +283,9 @@ static void resize(struct vo *vo)
                          1000LL * vc->flip_offset_window;
     vo_set_queue_params(vo, vc->flip_offset_us, 1);
 
-    if (vc->output_surface_w < vo->dwidth || vc->output_surface_h < vo->dheight) {
+    if (vc->output_surface_w < vo->dwidth || vc->output_surface_h < vo->dheight ||
+        vc->rotation != vo->params->rotate)
+    {
         vc->output_surface_w = s_size(max_w, vc->output_surface_w, vo->dwidth);
         vc->output_surface_h = s_size(max_h, vc->output_surface_h, vo->dheight);
         // Creation of output_surfaces
@@ -309,6 +309,7 @@ static void resize(struct vo *vo)
             vdp_st = vdp->output_surface_destroy(vc->rotation_surface);
             CHECK_VDP_WARNING(vo, "Error when calling "
                               "vdp_output_surface_destroy");
+            vc->rotation_surface = VDP_INVALID_HANDLE;
         }
         if (vo->params->rotate == 90 || vo->params->rotate == 270) {
             vdp_st = vdp->output_surface_create(vc->vdp_device,
@@ -327,6 +328,7 @@ static void resize(struct vo *vo)
         MP_DBG(vo, "vdpau rotation surface create: %u\n",
                vc->rotation_surface);
     }
+    vc->rotation = vo->params->rotate;
     vo->want_redraw = true;
 }
 
@@ -806,7 +808,7 @@ static void flip_page(struct vo *vo)
      * not make the target time in reality. Without this check we could drop
      * every frame, freezing the display completely if video lags behind.
      */
-    if (now > PREV_VSYNC(FFMAX(pts, vc->last_queue_time + vc->vsync_interval)))
+    if (now > PREV_VSYNC(MPMAX(pts, vc->last_queue_time + vc->vsync_interval)))
         npts = UINT64_MAX;
 
     /* Allow flipping a frame at a vsync if its presentation time is a
@@ -833,15 +835,15 @@ static void flip_page(struct vo *vo)
 
     vc->dropped_time = ideal_pts;
 
-    pts = FFMAX(pts, vc->last_queue_time + vc->vsync_interval);
-    pts = FFMAX(pts, now);
+    pts = MPMAX(pts, vc->last_queue_time + vc->vsync_interval);
+    pts = MPMAX(pts, now);
     if (npts < PREV_VSYNC(pts) + vc->vsync_interval)
         goto drop;
 
     int num_flips = update_presentation_queue_status(vo);
     vsync = vc->recent_vsync_time + num_flips * vc->vsync_interval;
-    pts = FFMAX(pts, now);
-    pts = FFMAX(pts, vsync + (vc->vsync_interval >> 2));
+    pts = MPMAX(pts, now);
+    pts = MPMAX(pts, vsync + (vc->vsync_interval >> 2));
     vsync = PREV_VSYNC(pts);
     if (npts < vsync + vc->vsync_interval)
         goto drop;
@@ -1027,7 +1029,7 @@ static int preinit(struct vo *vo)
 
     if (mp_vdpau_guess_if_emulated(vc->mpvdp)) {
         MP_WARN(vo, "VDPAU is most likely emulated via VA-API.\n"
-                    "This is inefficient. Use --vo=opengl instead.\n");
+                    "This is inefficient. Use --vo=gpu instead.\n");
     }
 
     // Mark everything as invalid first so uninit() can tell what has been
@@ -1041,6 +1043,11 @@ static int preinit(struct vo *vo)
 
     vc->vdp->bitmap_surface_query_capabilities(vc->vdp_device, VDP_RGBA_FORMAT_A8,
                             &vc->supports_a8, &(uint32_t){0}, &(uint32_t){0});
+
+    MP_WARN(vo, "Warning: this compatibility VO is low quality and may "
+                "have issues with OSD, scaling, screenshots and more.\n"
+                "vo=gpu is the preferred choice in any case and "
+                "includes VDPAU support via hwdec=vdpau or vdpau-copy.\n");
 
     return 0;
 }

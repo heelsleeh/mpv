@@ -25,16 +25,22 @@
 
 #include "common/msg.h"
 #include "common/common.h"
-
+#include "filters/f_autoconvert.h"
+#include "filters/filter.h"
+#include "filters/filter_internal.h"
+#include "filters/user_filters.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
-#include "vf.h"
 
 #include "options/m_option.h"
 
-struct vf_priv_s {
+struct priv {
+    struct vf_format_opts *opts;
+    struct mp_autoconvert *conv;
+};
+
+struct vf_format_opts {
     int fmt;
-    int outfmt;
     int colormatrix;
     int colorlevels;
     int primaries;
@@ -43,54 +49,14 @@ struct vf_priv_s {
     int light;
     int chroma_location;
     int stereo_in;
-    int stereo_out;
     int rotate;
     int dw, dh;
     double dar;
-    int spherical;
-    float spherical_ref_angles[3];
+    int convert;
 };
 
-static bool is_compatible(int fmt1, int fmt2)
+static void set_params(struct vf_format_opts *p, struct mp_image_params *out)
 {
-    struct mp_imgfmt_desc d1 = mp_imgfmt_get_desc(fmt1);
-    struct mp_imgfmt_desc d2 = mp_imgfmt_get_desc(fmt2);
-    if (d1.num_planes < d2.num_planes)
-        return false;
-    if (!(d1.flags & MP_IMGFLAG_BYTE_ALIGNED) ||
-        !(d2.flags & MP_IMGFLAG_BYTE_ALIGNED))
-        return false;
-    for (int n = 0; n < MPMIN(d1.num_planes, d2.num_planes); n++) {
-        if (d1.bytes[n] != d2.bytes[n])
-            return false;
-        if (d1.xs[n] != d2.xs[n] || d1.ys[n] != d2.ys[n])
-            return false;
-    }
-    return true;
-}
-
-static int query_format(struct vf_instance *vf, unsigned int fmt)
-{
-    if (fmt == vf->priv->fmt || !vf->priv->fmt) {
-        if (vf->priv->outfmt) {
-            if (!is_compatible(fmt, vf->priv->outfmt))
-                return 0;
-            fmt = vf->priv->outfmt;
-        }
-        return vf_next_query_format(vf, fmt);
-    }
-    return 0;
-}
-
-static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
-                    struct mp_image_params *out)
-{
-    struct vf_priv_s *p = vf->priv;
-
-    *out = *in;
-
-    if (p->outfmt)
-        out->imgfmt = p->outfmt;
     if (p->colormatrix)
         out->color.space = p->colormatrix;
     if (p->colorlevels)
@@ -98,8 +64,9 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
     if (p->primaries)
         out->color.primaries = p->primaries;
     if (p->gamma) {
+        enum mp_csp_trc in_gamma = p->gamma;
         out->color.gamma = p->gamma;
-        if (in->color.gamma != out->color.gamma) {
+        if (in_gamma != out->color.gamma) {
             // When changing the gamma function explicitly, also reset stuff
             // related to the gamma function since that information will almost
             // surely be false now and have to be re-inferred
@@ -114,9 +81,7 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
     if (p->chroma_location)
         out->chroma_location = p->chroma_location;
     if (p->stereo_in)
-        out->stereo_in = p->stereo_in;
-    if (p->stereo_out)
-        out->stereo_out = p->stereo_out;
+        out->stereo3d = p->stereo_in;
     if (p->rotate >= 0)
         out->rotate = p->rotate;
 
@@ -129,39 +94,90 @@ static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
     if (p->dar > 0)
         dsize = av_d2q(p->dar, INT_MAX);
     mp_image_params_set_dsize(out, dsize.num, dsize.den);
+}
 
-    if (p->spherical)
-        out->spherical.type = p->spherical;
-    for (int n = 0; n < 3; n++) {
-        if (isfinite(p->spherical_ref_angles[n]))
-            out->spherical.ref_angles[n] = p->spherical_ref_angles[n];
+static void vf_format_process(struct mp_filter *f)
+{
+    struct priv *priv = f->priv;
+
+    if (mp_pin_can_transfer_data(priv->conv->f->pins[0], f->ppins[0])) {
+        struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+
+        if (priv->opts->convert && frame.type == MP_FRAME_VIDEO) {
+            struct mp_image *img = frame.data;
+            struct mp_image_params par = img->params;
+            int outfmt = priv->opts->fmt;
+
+            // If we convert from RGB to YUV, default to limited range.
+            if (mp_imgfmt_get_forced_csp(img->imgfmt) == MP_CSP_RGB &&
+                outfmt && mp_imgfmt_get_forced_csp(outfmt) == MP_CSP_AUTO)
+            {
+                par.color.levels = MP_CSP_LEVELS_TV;
+            }
+
+            set_params(priv->opts, &par);
+
+            if (par.imgfmt != outfmt) {
+                par.imgfmt = outfmt;
+                par.hw_subfmt = 0;
+            }
+            mp_image_params_guess_csp(&par);
+
+            mp_autoconvert_set_target_image_params(priv->conv, &par);
+        }
+
+        mp_pin_in_write(priv->conv->f->pins[0], frame);
     }
 
-    // Make sure the user-overrides are consistent (no RGB csp for YUV, etc.).
-    mp_image_params_guess_csp(out);
+    if (mp_pin_can_transfer_data(f->ppins[1], priv->conv->f->pins[1])) {
+        struct mp_frame frame = mp_pin_out_read(priv->conv->f->pins[1]);
 
-    return 0;
+        if (!priv->opts->convert && frame.type == MP_FRAME_VIDEO) {
+            struct mp_image *img = frame.data;
+
+            set_params(priv->opts, &img->params);
+            mp_image_params_guess_csp(&img->params);
+        }
+
+        mp_pin_in_write(f->ppins[1], frame);
+    }
 }
 
-static struct mp_image *filter(struct vf_instance *vf, struct mp_image *mpi)
+static const struct mp_filter_info vf_format_filter = {
+    .name = "format",
+    .process = vf_format_process,
+    .priv_size = sizeof(struct priv),
+};
+
+static struct mp_filter *vf_format_create(struct mp_filter *parent, void *options)
 {
-    if (vf->priv->outfmt)
-        mp_image_setfmt(mpi, vf->priv->outfmt);
-    return mpi;
+    struct mp_filter *f = mp_filter_create(parent, &vf_format_filter);
+    if (!f) {
+        talloc_free(options);
+        return NULL;
+    }
+
+    struct priv *priv = f->priv;
+    priv->opts = talloc_steal(priv, options);
+
+    mp_filter_add_pin(f, MP_PIN_IN, "in");
+    mp_filter_add_pin(f, MP_PIN_OUT, "out");
+
+    priv->conv = mp_autoconvert_create(f);
+    if (!priv->conv) {
+        talloc_free(f);
+        return NULL;
+    }
+
+    if (priv->opts->fmt)
+        mp_autoconvert_add_imgfmt(priv->conv, priv->opts->fmt, 0);
+
+    return f;
 }
 
-static int vf_open(vf_instance_t *vf)
-{
-    vf->query_format = query_format;
-    vf->reconfig = reconfig;
-    vf->filter = filter;
-    return 1;
-}
-
-#define OPT_BASE_STRUCT struct vf_priv_s
+#define OPT_BASE_STRUCT struct vf_format_opts
 static const m_option_t vf_opts_fields[] = {
     OPT_IMAGEFORMAT("fmt", fmt, 0),
-    OPT_IMAGEFORMAT("outfmt", outfmt, 0),
     OPT_CHOICE_C("colormatrix", colormatrix, 0, mp_csp_names),
     OPT_CHOICE_C("colorlevels", colorlevels, 0, mp_csp_levels_names),
     OPT_CHOICE_C("primaries", primaries, 0, mp_csp_prim_names),
@@ -170,28 +186,25 @@ static const m_option_t vf_opts_fields[] = {
     OPT_CHOICE_C("light", light, 0, mp_csp_light_names),
     OPT_CHOICE_C("chroma-location", chroma_location, 0, mp_chroma_names),
     OPT_CHOICE_C("stereo-in", stereo_in, 0, mp_stereo3d_names),
-    OPT_CHOICE_C("stereo-out", stereo_out, 0, mp_stereo3d_names),
     OPT_INTRANGE("rotate", rotate, 0, -1, 359),
     OPT_INT("dw", dw, 0),
     OPT_INT("dh", dh, 0),
     OPT_DOUBLE("dar", dar, 0),
-    OPT_CHOICE_C("spherical", spherical, 0, mp_spherical_names),
-    OPT_FLOAT("spherical-yaw", spherical_ref_angles[0], 0),
-    OPT_FLOAT("spherical-pitch", spherical_ref_angles[1], 0),
-    OPT_FLOAT("spherical-roll", spherical_ref_angles[2], 0),
+    OPT_FLAG("convert", convert, 0),
     OPT_REMOVED("outputlevels", "use the --video-output-levels global option"),
     OPT_REMOVED("peak", "use sig-peak instead (changed value scale!)"),
     {0}
 };
 
-const vf_info_t vf_info_format = {
-    .description = "force output format",
-    .name = "format",
-    .open = vf_open,
-    .priv_size = sizeof(struct vf_priv_s),
-    .options = vf_opts_fields,
-    .priv_defaults = &(const struct vf_priv_s){
-        .rotate = -1,
-        .spherical_ref_angles = {NAN, NAN, NAN},
+const struct mp_user_filter_entry vf_format = {
+    .desc = {
+        .description = "force output format",
+        .name = "format",
+        .priv_size = sizeof(OPT_BASE_STRUCT),
+        .priv_defaults = &(const OPT_BASE_STRUCT){
+            .rotate = -1,
+        },
+        .options = vf_opts_fields,
     },
+    .create = vf_format_create,
 };

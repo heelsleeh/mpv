@@ -8,6 +8,7 @@
 
 local mp = require 'mp'
 local options = require 'mp.options'
+local utils = require 'mp.utils'
 
 -- Options
 local o = {
@@ -38,8 +39,8 @@ local o = {
     plot_color = "FFFFFF",
 
     -- Text style
-    font = "Source Sans Pro",
-    font_mono = "Source Sans Pro",   -- monospaced digits are sufficient
+    font = "sans",
+    font_mono = "monospace",   -- monospaced digits are sufficient
     font_size = 8,
     font_color = "FFFFFF",
     border_size = 0.8,
@@ -82,6 +83,8 @@ local min = math.min
 local recorder = nil
 -- Timer used for redrawing (toggling) and clearing the screen (oneshot)
 local display_timer = nil
+-- Timer used to update cache stats.
+local cache_recorder_timer = nil
 -- Current page and <page key>:<page function> mappings
 local curr_page = o.key_page_1
 local pages = {}
@@ -91,10 +94,12 @@ local ass_stop = mp.get_property_osd("osd-ass-cc/1")
 -- Ring buffers for the values used to construct a graph.
 -- .pos denotes the current position, .len the buffer length
 -- .max is the max value in the corresponding buffer
-local vsratio_buf, vsjitter_buf
+local vsratio_buf, vsjitter_buf, cache_ahead_buf, cache_total_buf
 local function init_buffers()
     vsratio_buf = {0, pos = 1, len = 50, max = 0}
     vsjitter_buf = {0, pos = 1, len = 50, max = 0}
+    cache_ahead_buf = {0, pos = 1, len = 50, max = 0}
+    cache_total_buf = {0, pos = 1, len = 50, max = 0}
 end
 -- Save all properties known to this version of mpv
 local property_list = {}
@@ -160,18 +165,6 @@ local function has_vo_window()
 end
 
 
-local function has_video()
-    local r = mp.get_property("video")
-    return r and r ~= "no" and r ~= ""
-end
-
-
-local function has_audio()
-    local r = mp.get_property("audio")
-    return r and r ~= "no" and r ~= ""
-end
-
-
 local function has_ansi()
     local is_windows = type(package) == 'table'
         and type(package.config) == 'string'
@@ -232,6 +225,23 @@ local function generate_graph(values, i, len, v_max, v_avg, scale, x_tics)
 end
 
 
+local function append(s, str, attr)
+    if not str then
+        return false
+    end
+    attr.prefix_sep = attr.prefix_sep or o.prefix_sep
+    attr.indent = attr.indent or o.indent
+    attr.nl = attr.nl or o.nl
+    attr.suffix = attr.suffix or ""
+    attr.prefix = attr.prefix or ""
+    attr.no_prefix_markup = attr.no_prefix_markup or false
+    attr.prefix = attr.no_prefix_markup and attr.prefix or b(attr.prefix)
+    s[#s+1] = format("%s%s%s%s%s%s", attr.nl, attr.indent,
+                     attr.prefix, attr.prefix_sep, no_ASS(str), attr.suffix)
+    return true
+end
+
+
 -- Format and append a property.
 -- A property whose value is either `nil` or empty (hereafter called "invalid")
 -- is skipped and not appended.
@@ -253,19 +263,7 @@ local function append_property(s, prop, attr, excluded)
         end
         return false
     end
-
-    attr.prefix_sep = attr.prefix_sep or o.prefix_sep
-    attr.indent = attr.indent or o.indent
-    attr.nl = attr.nl or o.nl
-    attr.suffix = attr.suffix or ""
-    attr.prefix = attr.prefix or ""
-    attr.no_prefix_markup = attr.no_prefix_markup or false
-    attr.prefix = attr.no_prefix_markup and attr.prefix or b(attr.prefix)
-    ret = attr.no_value and "" or ret
-
-    s[#s+1] = format("%s%s%s%s%s%s", attr.nl, attr.indent,
-                     attr.prefix, attr.prefix_sep, no_ASS(ret), attr.suffix)
-    return true
+    return append(s, ret, attr)
 end
 
 
@@ -430,10 +428,14 @@ end
 
 
 local function add_file(s)
-    append_property(s, "filename", {prefix="File:", nl="", indent=""})
+    append(s, "", {prefix="File:", nl="", indent=""})
+    append_property(s, "filename", {prefix_sep="", nl="", indent=""})
     if not (mp.get_property_osd("filename") == mp.get_property_osd("media-title")) then
         append_property(s, "media-title", {prefix="Title:"})
     end
+
+    local fs = append_property(s, "file-size", {prefix="Size:"})
+    append_property(s, "file-format", {prefix="Format/Protocol:", nl=fs and "" or o.nl})
 
     local ch_index = mp.get_property_number("chapter")
     if ch_index and ch_index >= 0 then
@@ -442,24 +444,39 @@ local function add_file(s)
                         {prefix="(" .. tostring(ch_index + 1) .. "/", suffix=")", nl="",
                          indent=" ", prefix_sep=" ", no_prefix_markup=true})
     end
-    if append_property(s, "cache-used", {prefix="Cache:"}) then
-        append_property(s, "demuxer-cache-duration",
-                        {prefix="+", suffix=" sec", nl="", indent=o.prefix_sep,
-                         prefix_sep="", no_prefix_markup=true})
-        append_property(s, "cache-speed",
-                        {prefix="", suffix="", nl="", indent=o.prefix_sep,
-                         prefix_sep="", no_prefix_markup=true})
+
+    local demuxer_cache = mp.get_property_native("demuxer-cache-state", {})
+    if demuxer_cache["fw-bytes"] then
+        demuxer_cache = demuxer_cache["fw-bytes"] -- returns bytes
+    else
+        demuxer_cache = 0
     end
-    append_property(s, "file-size", {prefix="Size:"})
+    local demuxer_secs = mp.get_property_number("demuxer-cache-duration", 0)
+    if demuxer_cache + demuxer_secs > 0 then
+        append(s, utils.format_bytes_humanized(demuxer_cache), {prefix="Total Cache:"})
+        append(s, format("%.1f", demuxer_secs), {prefix="(", suffix=" sec)", nl="",
+               no_prefix_markup=true, prefix_sep="", indent=o.prefix_sep})
+        local speed = mp.get_property_number("cache-speed", 0)
+        if speed > 0 then
+            append(s, utils.format_bytes_humanized(speed) .. "/s", {prefix="Speed:", nl="",
+                   indent=o.prefix_sep, no_prefix_markup=true})
+        end
+    end
 end
 
 
 local function add_video(s)
-    if not has_video() then
+    local r = mp.get_property_native("video-params")
+    -- in case of e.g. lavi-complex there can be no input video, only output
+    if not r then
+        r = mp.get_property_native("video-out-params")
+    end
+    if not r then
         return
     end
 
-    if append_property(s, "video-codec", {prefix=o.nl .. o.nl .. "Video:", nl="", indent=""}) then
+    append(s, "", {prefix=o.nl .. o.nl .. "Video:", nl="", indent=""})
+    if append_property(s, "video-codec", {prefix_sep="", nl="", indent=""}) then
         append_property(s, "hwdec-current", {prefix="(hwdec:", nl="", indent=" ",
                          no_prefix_markup=true, suffix=")"}, {no=true, [""]=true})
     end
@@ -486,41 +503,46 @@ local function add_video(s)
     append_display_sync(s)
     append_perfdata(s, o.print_perfdata_passes)
 
-    if append_property(s, "video-params/w", {prefix="Native Resolution:"}) then
-        append_property(s, "video-params/h",
-                        {prefix="x", nl="", indent=" ", prefix_sep=" ", no_prefix_markup=true})
+    if append(s, r["w"], {prefix="Native Resolution:"}) then
+        append(s, r["h"], {prefix="x", nl="", indent=" ", prefix_sep=" ", no_prefix_markup=true})
     end
     append_property(s, "window-scale", {prefix="Window Scale:"})
-    append_property(s, "video-params/aspect", {prefix="Aspect Ratio:"})
-    append_property(s, "video-params/pixelformat", {prefix="Pixel Format:"})
+    append(s, format("%.2f", r["aspect"]), {prefix="Aspect Ratio:"})
+    append(s, r["pixelformat"], {prefix="Pixel Format:"})
 
     -- Group these together to save vertical space
-    local prim = append_property(s, "video-params/primaries", {prefix="Primaries:"})
-    local cmat = append_property(s, "video-params/colormatrix",
-                                     {prefix="Colormatrix:", nl=prim and "" or o.nl})
-    append_property(s, "video-params/colorlevels", {prefix="Levels:", nl=cmat and "" or o.nl})
+    local prim = append(s, r["primaries"], {prefix="Primaries:"})
+    local cmat = append(s, r["colormatrix"], {prefix="Colormatrix:", nl=prim and "" or o.nl})
+    append(s, r["colorlevels"], {prefix="Levels:", nl=cmat and "" or o.nl})
 
     -- Append HDR metadata conditionally (only when present and interesting)
-    local hdrpeak = mp.get_property_number("video-params/sig-peak", 0)
+    local hdrpeak = r["sig-peak"] or 0
     local hdrinfo = ""
     if hdrpeak > 1 then
-        hdrinfo = " (HDR peak: " .. hdrpeak .. ")"
+        hdrinfo = " (HDR peak: " .. format("%.2f", hdrpeak) .. ")"
     end
 
-    append_property(s, "video-params/gamma", {prefix="Gamma:", suffix=hdrinfo})
+    append(s, r["gamma"], {prefix="Gamma:", suffix=hdrinfo})
     append_property(s, "packet-video-bitrate", {prefix="Bitrate:", suffix=" kbps"})
     append_filters(s, "vf", "Filters:")
 end
 
 
 local function add_audio(s)
-    if not has_audio() then
+    local r = mp.get_property_native("audio-params")
+    -- in case of e.g. lavi-complex there can be no input audio, only output
+    if not r then
+        r = mp.get_property_native("audio-out-params")
+    end
+    if not r then
         return
     end
 
-    append_property(s, "audio-codec", {prefix=o.nl .. o.nl .. "Audio:", nl="", indent=""})
-    append_property(s, "audio-params/samplerate", {prefix="Sample Rate:", suffix=" Hz"})
-    append_property(s, "audio-params/channel-count", {prefix="Channels:"})
+    append(s, "", {prefix=o.nl .. o.nl .. "Audio:", nl="", indent=""})
+    append_property(s, "audio-codec", {prefix_sep="", nl="", indent=""})
+    local cc = append(s, r["channel-count"], {prefix="Channels:"})
+    append(s, r["format"], {prefix="Format:", nl=cc and "" or o.nl})
+    append(s, r["samplerate"], {prefix="Sample Rate:", suffix=" Hz"})
     append_property(s, "packet-audio-bitrate", {prefix="Bitrate:", suffix=" kbps"})
     append_filters(s, "af", "Filters:")
 end
@@ -577,19 +599,132 @@ local function vo_stats()
     return table.concat(stats)
 end
 
-
--- Returns an ASS string with stats about filters/profiles/shaders
-local function filter_stats()
-    return "coming soon"
+local function opt_time(t)
+    if type(t) == type(1.1) then
+        return mp.format_time(t)
+    end
+    return "?"
 end
 
+-- Returns an ASS string with stats about the demuxer cache etc.
+local function cache_stats()
+    local stats = {}
+
+    add_header(stats)
+    append(stats, "", {prefix=o.nl .. o.nl .. "Cache info:", nl="", indent=""})
+
+    local info = mp.get_property_native("demuxer-cache-state")
+    if info == nil then
+        append(stats, "Unavailable.", {})
+        return table.concat(stats)
+    end
+
+    local a = info["reader-pts"]
+    local b = info["cache-end"]
+
+    append(stats, opt_time(a) .. " - " .. opt_time(b), {prefix = "Packet queue:"})
+
+    local r = nil
+    if (a ~= nil) and (b ~= nil) then
+        r = b - a
+    end
+
+    local r_graph = nil
+    if not display_timer.oneshot and o.use_ass then
+        r_graph = generate_graph(cache_ahead_buf, cache_ahead_buf.pos,
+                                 cache_ahead_buf.len, cache_ahead_buf.max,
+                                 nil, 0.8, 1)
+        r_graph = o.prefix_sep .. r_graph
+    end
+    append(stats, opt_time(r), {prefix = "Read-ahead:", suffix = r_graph})
+
+    -- These states are not necessarily exclusive. They're about potentially
+    -- separate mechanisms, whose states may be decoupled.
+    local state = "reading"
+    local seek_ts = info["debug-seeking"]
+    if seek_ts ~= nil then
+        state = "seeking (to " .. mp.format_time(seek_ts) .. ")"
+    elseif info["eof"] == true then
+        state = "eof"
+    elseif info["underrun"] then
+        state = "underrun"
+    elseif info["idle"]  == true then
+        state = "inactive"
+    end
+    append(stats, state, {prefix = "State:"})
+
+    local total_graph = nil
+    if not display_timer.oneshot and o.use_ass then
+        total_graph = generate_graph(cache_total_buf, cache_total_buf.pos,
+                                     cache_total_buf.len, cache_total_buf.max,
+                                     nil, 0.8, 1)
+        total_graph = o.prefix_sep .. total_graph
+    end
+    append(stats, utils.format_bytes_humanized(info["total-bytes"]),
+           {prefix = "Total RAM:", suffix = total_graph})
+    append(stats, utils.format_bytes_humanized(info["fw-bytes"]),
+           {prefix = "Forward RAM:"})
+
+    local fc = info["file-cache-bytes"]
+    if fc ~= nil then
+        fc = utils.format_bytes_humanized(fc)
+    else
+        fc = "(disabled)"
+    end
+    append(stats, fc, {prefix = "Disk cache:"})
+
+    append(stats, info["debug-low-level-seeks"], {prefix = "Media seeks:"})
+    append(stats, info["debug-byte-level-seeks"], {prefix = "Stream seeks:"})
+
+    append(stats, "", {prefix=o.nl .. o.nl .. "Ranges:", nl="", indent=""})
+
+    append(stats, info["bof-cached"] and "yes" or "no",
+           {prefix = "Start cached:"})
+    append(stats, info["eof-cached"] and "yes" or "no",
+           {prefix = "End cached:"})
+
+    local ranges = info["seekable-ranges"] or {}
+    for n, r in ipairs(ranges) do
+        append(stats, mp.format_time(r["start"]) .. " - " ..
+                      mp.format_time(r["end"]),
+               {prefix = format("Range %s:", n)})
+    end
+
+    return table.concat(stats)
+end
+
+local function graph_add_value(graph, value)
+    graph.pos = (graph.pos % graph.len) + 1
+    graph[graph.pos] = value
+    graph.max = max(graph.max, value)
+end
+
+-- Record 1 sample of cache statistics.
+-- (Unlike record_data(), this does not return a function, but runs directly.)
+local function record_cache_stats()
+    local info = mp.get_property_native("demuxer-cache-state")
+    if info == nil then
+        return
+    end
+
+    local a = info["reader-pts"]
+    local b = info["cache-end"]
+    if (a ~= nil) and (b ~= nil) then
+        graph_add_value(cache_ahead_buf, b - a)
+    end
+
+    graph_add_value(cache_total_buf, info["total-bytes"])
+end
+
+cache_recorder_timer = mp.add_periodic_timer(0.25, record_cache_stats)
+cache_recorder_timer:kill()
 
 -- Current page and <page key>:<page function> mapping
 curr_page = o.key_page_1
 pages = {
     [o.key_page_1] = { f = default_stats, desc = "Default" },
     [o.key_page_2] = { f = vo_stats, desc = "Extended Frame Timings" },
-    --[o.key_page_3] = { f = filter_stats, desc = "Dummy" },
+    [o.key_page_3] = { f = cache_stats, desc = "Cache Statistics" },
 }
 
 
@@ -625,7 +760,6 @@ local function record_data(skip)
         end
     end
 end
-
 
 -- Call the function for `page` and print it to OSD
 local function print_page(page)
@@ -676,6 +810,7 @@ local function process_key_binding(oneshot)
         -- Previous and current keys were toggling -> end toggling
         elseif not display_timer.oneshot and not oneshot then
             display_timer:kill()
+            cache_recorder_timer:stop()
             clear_screen()
             remove_page_bindings()
             if recorder then
@@ -688,6 +823,7 @@ local function process_key_binding(oneshot)
         if not oneshot and (o.plot_vsync_jitter or o.plot_vsync_ratio) then
             recorder = record_data(o.skip_frames)
             mp.register_event("tick", recorder)
+            cache_recorder_timer:resume()
         end
         display_timer:kill()
         display_timer.oneshot = oneshot

@@ -816,7 +816,7 @@ static int preinit(struct vo *vo)
     if (!p->image_formats)
         goto fail;
 
-    p->pool = mp_image_pool_new(MAX_OUTPUT_SURFACES + 3);
+    p->pool = mp_image_pool_new(p);
     va_pool_set_allocator(p->pool, p->mpvaapi, VA_RT_FORMAT_YUV420);
 
     int max_subpic_formats = vaMaxNumSubpictureFormats(p->display);
@@ -865,6 +865,11 @@ static int preinit(struct vo *vo)
 
     vo->hwdec_devs = hwdec_devices_create();
     hwdec_devices_add(vo->hwdec_devs, &p->mpvaapi->hwctx);
+
+    MP_WARN(vo, "Warning: this compatibility VO is low quality and may "
+                "have issues with OSD, scaling, screenshots and more.\n"
+                "vo=gpu is the preferred choice in any case and "
+                "includes VA-API support via hwdec=vaapi or vaapi-copy.\n");
 
     return 0;
 

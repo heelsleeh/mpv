@@ -75,7 +75,7 @@ static enum cue_command read_cmd(struct bstr *data, struct bstr *out_params)
             if (rest.len && !strchr(WHITESPACE, rest.start[0]))
                 continue;
             if (out_params)
-                *out_params = rest;
+                *out_params = bstr_lstrip(rest);
             return cue_command_strings[n].command;
         }
     }
@@ -105,16 +105,25 @@ static char *read_quoted(void *talloc_ctx, struct bstr *data)
     return bstrto0(talloc_ctx, res);
 }
 
-// Read a 2 digit unsigned decimal integer.
+static struct bstr strip_quotes(struct bstr data)
+{
+    bstr s = data;
+    if (bstr_eatstart0(&s, "\"") && bstr_eatend0(&s, "\""))
+        return s;
+    return data;
+}
+
+// Read an unsigned decimal integer.
+// Optionally check if it is 2 digit.
 // Return -1 on failure.
-static int read_int_2(struct bstr *data)
+static int read_int(struct bstr *data, bool two_digit)
 {
     *data = bstr_lstrip(*data);
     if (data->len && data->start[0] == '-')
         return -1;
     struct bstr s = *data;
     int res = (int)bstrtoll(s, &s, 10);
-    if (data->len == s.len || data->len - s.len > 2)
+    if (data->len == s.len || (two_digit && data->len - s.len > 2))
         return -1;
     *data = s;
     return res;
@@ -124,11 +133,11 @@ static double read_time(struct bstr *data)
 {
     struct bstr s = *data;
     bool ok = true;
-    double t1 = read_int_2(&s);
+    double t1 = read_int(&s, false);
     ok = eat_char(&s, ':') && ok;
-    double t2 = read_int_2(&s);
+    double t2 = read_int(&s, true);
     ok = eat_char(&s, ':') && ok;
-    double t3 = read_int_2(&s);
+    double t3 = read_int(&s, true);
     ok = ok && t1 >= 0 && t2 >= 0 && t3 >= 0;
     return ok ? t1 * 60.0 + t2 + t3 * SECS_PER_CUE_FRAME : 0;
 }
@@ -193,11 +202,11 @@ struct cue_file *mp_parse_cue(struct bstr data)
                 [CUE_PERFORMER] = "performer",
             };
             struct mp_tags *tags = cur_track ? cur_track->tags : f->tags;
-            mp_tags_set_bstr(tags, bstr0(metanames[cmd]), param);
+            mp_tags_set_bstr(tags, bstr0(metanames[cmd]), strip_quotes(param));
             break;
         }
         case CUE_INDEX: {
-            int type = read_int_2(&param);
+            int type = read_int(&param, true);
             double time = read_time(&param);
             if (cur_track) {
                 if (type == 1) {

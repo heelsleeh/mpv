@@ -39,6 +39,10 @@
 
 #include "config.h"
 
+#if HAVE_MACOS_COCOA_CB
+#include "osdep/macOS_swift.h"
+#endif
+
 @interface EventsResponder ()
 {
     struct input_ctx *_inputContext;
@@ -194,11 +198,6 @@ void cocoa_put_key(int keycode)
     [[EventsResponder sharedInstance] putKey:keycode];
 }
 
-void cocoa_put_key_event(void *event)
-{
-    [[EventsResponder sharedInstance] handleKey:event];
-}
-
 void cocoa_put_key_with_modifiers(int keycode, int modifiers)
 {
     keycode |= [[EventsResponder sharedInstance] mapKeyModifiers:modifiers];
@@ -309,10 +308,13 @@ void cocoa_set_mpv_handle(struct mpv_handle *ctx)
 - (BOOL)setMpvHandle:(struct mpv_handle *)ctx
 {
     if (_is_application) {
-        dispatch_sync(dispatch_get_main_queue(), ^{ _ctx = ctx; });
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            _ctx = ctx;
+            [NSApp setMpvHandle:ctx];
+        });
         return YES;
     } else {
-        mpv_detach_destroy(ctx);
+        mpv_destroy(ctx);
         return NO;
     }
 }
@@ -331,16 +333,22 @@ void cocoa_set_mpv_handle(struct mpv_handle *ctx)
 
 -(void)processEvent:(struct mpv_event *)event
 {
+    if(_is_application) {
+        [NSApp processEvent:event];
+    }
+
     switch (event->event_id) {
     case MPV_EVENT_SHUTDOWN: {
-        mpv_detach_destroy(_ctx);
+        #if HAVE_MACOS_COCOA_CB
+        if ([(Application *)NSApp cocoaCB].isShuttingDown) {
+            _ctx = nil;
+            return;
+        }
+        #endif
+        mpv_destroy(_ctx);
         _ctx = nil;
         break;
     }
-    }
-
-    if(_is_application) {
-        [NSApp processEvent:event];
     }
 }
 
@@ -369,7 +377,8 @@ void cocoa_set_mpv_handle(struct mpv_handle *ctx)
 
 - (void)restartMediaKeys
 {
-    CGEventTapEnable(self->_mk_tap_port, true);
+    if (self->_mk_tap_port)
+        CGEventTapEnable(self->_mk_tap_port, true);
 }
 
 - (void)setHighestPriotityMediaKeysTap
@@ -404,10 +413,10 @@ void cocoa_set_mpv_handle(struct mpv_handle *ctx)
             tap_event_callback,
             self);
 
-        assert(self->_mk_tap_port != nil);
-
-        NSMachPort *port = (NSMachPort *)self->_mk_tap_port;
-        [[NSRunLoop mainRunLoop] addPort:port forMode:NSRunLoopCommonModes];
+        if (self->_mk_tap_port) {
+            NSMachPort *port = (NSMachPort *)self->_mk_tap_port;
+            [[NSRunLoop mainRunLoop] addPort:port forMode:NSRunLoopCommonModes];
+        }
     });
 }
 
@@ -415,10 +424,12 @@ void cocoa_set_mpv_handle(struct mpv_handle *ctx)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMachPort *port = (NSMachPort *)self->_mk_tap_port;
-        CGEventTapEnable(self->_mk_tap_port, false);
-        [[NSRunLoop mainRunLoop] removePort:port forMode:NSRunLoopCommonModes];
-        CFRelease(self->_mk_tap_port);
-        self->_mk_tap_port = nil;
+        if (port) {
+            CGEventTapEnable(self->_mk_tap_port, false);
+            [[NSRunLoop mainRunLoop] removePort:port forMode:NSRunLoopCommonModes];
+            CFRelease(self->_mk_tap_port);
+            self->_mk_tap_port = nil;
+        }
     });
 }
 

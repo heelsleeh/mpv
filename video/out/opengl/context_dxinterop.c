@@ -346,7 +346,7 @@ static void fill_presentparams(struct ra_ctx *ctx,
         .BackBufferHeight = ctx->vo->dheight ? ctx->vo->dheight : 1,
         // Add one frame for the backbuffer and one frame of "slack" to reduce
         // contention with the window manager when acquiring the backbuffer
-        .BackBufferCount = ctx->opts.swapchain_depth + 2,
+        .BackBufferCount = ctx->vo->opts->swapchain_depth + 2,
         .SwapEffect = IsWindows7OrGreater() ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_FLIP,
         // Automatically get the backbuffer format from the display format
         .BackBufferFormat = D3DFMT_UNKNOWN,
@@ -398,7 +398,7 @@ static int d3d_create(struct ra_ctx *ctx)
         return -1;
     }
 
-    IDirect3DDevice9Ex_SetMaximumFrameLatency(p->device, ctx->opts.swapchain_depth);
+    IDirect3DDevice9Ex_SetMaximumFrameLatency(p->device, ctx->vo->opts->swapchain_depth);
 
     // Register the Direct3D device with WGL_NV_dx_interop
     p->device_h = gl->DXOpenDeviceNV(p->device);
@@ -481,20 +481,6 @@ static int GLAPIENTRY dxgl_swap_interval(int interval)
     return 1;
 }
 
-static void * GLAPIENTRY dxgl_get_native_display(const char *name)
-{
-    if (!current_ctx || !name)
-        return NULL;
-    struct priv *p = current_ctx->priv;
-
-    if (p->device && strcmp("IDirect3DDevice9Ex", name) == 0) {
-        return p->device;
-    } else if (p->device_h && strcmp("dxinterop_device_HANDLE", name) == 0) {
-        return p->device_h;
-    }
-    return NULL;
-}
-
 static void dxgl_swap_buffers(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
@@ -560,7 +546,6 @@ static bool dxgl_init(struct ra_ctx *ctx)
 
     current_ctx = ctx;
     gl->SwapInterval = dxgl_swap_interval;
-    gl->MPGetNativeDisplay = dxgl_get_native_display;
 
     if (d3d_create(ctx) < 0)
         goto fail;
@@ -576,6 +561,9 @@ static bool dxgl_init(struct ra_ctx *ctx)
 
     if (!ra_gl_ctx_init(ctx, gl, params))
         goto fail;
+
+    ra_add_native_resource(ctx->ra, "IDirect3DDevice9Ex", p->device);
+    ra_add_native_resource(ctx->ra, "dxinterop_device_HANDLE", p->device_h);
 
     DwmEnableMMCSS(TRUE);
     return true;

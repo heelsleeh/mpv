@@ -19,8 +19,6 @@
 #include <assert.h>
 #include <limits.h>
 
-#include <libavutil/common.h>
-
 #include "common/common.h"
 #include "common/msg.h"
 #include "video/csputils.h"
@@ -140,8 +138,8 @@ static bool upload_osd(struct mpgl_osd *ctx, struct mpgl_osd_part *osd,
         ra_tex_free(ra, &osd->texture);
 
         osd->format = imgs->format;
-        osd->w = FFMAX(32, req_w);
-        osd->h = FFMAX(32, req_h);
+        osd->w = MPMAX(32, req_w);
+        osd->h = MPMAX(32, req_h);
 
         MP_VERBOSE(ctx, "Reallocating OSD texture to %dx%d.\n", osd->w, osd->h);
 
@@ -212,7 +210,7 @@ bool mpgl_osd_draw_prepare(struct mpgl_osd *ctx, int index,
     struct mpgl_osd_part *part = ctx->parts[index];
 
     enum sub_bitmap_format fmt = part->format;
-    if (!fmt || !part->num_subparts)
+    if (!fmt || !part->num_subparts || !part->texture)
         return false;
 
     gl_sc_uniform_texture(sc, "osdtex", part->texture);

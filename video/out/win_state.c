@@ -42,7 +42,7 @@ static void apply_autofit(int *w, int *h, int scr_w, int scr_h,
     if (!geo->wh_valid)
         return;
 
-    int dummy;
+    int dummy = 0;
     int n_w = *w, n_h = *h;
     m_geometry_apply(&dummy, &dummy, &n_w, &n_h, scr_w, scr_h, geo);
 
@@ -84,8 +84,8 @@ void vo_calc_window_geometry2(struct vo *vo, const struct mp_rect *screen,
     *out_geo = (struct vo_win_geometry){0};
 
     // The case of calling this function even though no video was configured
-    // yet (i.e. vo->params==NULL) happens when vo_opengl creates a hidden
-    // window in order to create an OpenGL context.
+    // yet (i.e. vo->params==NULL) happens when vo_gpu creates a hidden window
+    // in order to create a rendering context.
     struct mp_image_params params = { .w = 320, .h = 200 };
     if (vo->params)
         params = *vo->params;

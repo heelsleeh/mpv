@@ -49,7 +49,6 @@ struct sd_ass_priv {
     char last_text[500];
     struct mp_image_params video_params;
     struct mp_image_params last_params;
-    double sub_speed, video_fps, frame_fps;
     int64_t *seen_packets;
     int num_seen_packets;
     bool duration_unknown;
@@ -60,7 +59,7 @@ static void fill_plaintext(struct sd *sd, double pts);
 
 // Add default styles, if the track does not have any styles yet.
 // Apply style overrides if the user provides any.
-static void mp_ass_add_default_styles(ASS_Track *track, struct MPOpts *opts)
+static void mp_ass_add_default_styles(ASS_Track *track, struct mp_subtitle_opts *opts)
 {
     if (opts->ass_styles_file && opts->ass_style_override)
         ass_read_styles(track, opts->ass_styles_file, NULL);
@@ -121,7 +120,7 @@ static bool attachment_is_font(struct mp_log *log, struct demux_attachment *f)
 static void add_subtitle_fonts(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
-    struct MPOpts *opts = sd->opts;
+    struct mp_subtitle_opts *opts = sd->opts;
     if (!opts->ass_enabled || !opts->use_embedded_fonts || !sd->attachments)
         return;
     for (int i = 0; i < sd->attachments->num_entries; i++) {
@@ -147,27 +146,9 @@ static void enable_output(struct sd *sd, bool enable)
     }
 }
 
-static void update_subtitle_speed(struct sd *sd)
-{
-    struct MPOpts *opts = sd->opts;
-    struct sd_ass_priv *ctx = sd->priv;
-    ctx->sub_speed = 1.0;
-
-    if (ctx->video_fps > 0 && ctx->frame_fps > 0) {
-        MP_VERBOSE(sd, "Frame based format, dummy FPS: %f, video FPS: %f\n",
-                   ctx->frame_fps, ctx->video_fps);
-        ctx->sub_speed *= ctx->frame_fps / ctx->video_fps;
-    }
-
-    if (opts->sub_fps && ctx->video_fps)
-        ctx->sub_speed *= opts->sub_fps / ctx->video_fps;
-
-    ctx->sub_speed *= opts->sub_speed;
-}
-
 static int init(struct sd *sd)
 {
-    struct MPOpts *opts = sd->opts;
+    struct mp_subtitle_opts *opts = sd->opts;
     struct sd_ass_priv *ctx = talloc_zero(sd, struct sd_ass_priv);
     sd->priv = ctx;
 
@@ -188,6 +169,7 @@ static int init(struct sd *sd)
     }
 
     ctx->ass_library = mp_ass_init(sd->global, sd->log);
+    ass_set_extract_fonts(ctx->ass_library, opts->use_embedded_fonts);
 
     add_subtitle_fonts(sd);
 
@@ -195,8 +177,7 @@ static int init(struct sd *sd)
         ass_set_style_overrides(ctx->ass_library, opts->ass_force_style_list);
 
     ctx->ass_track = ass_new_track(ctx->ass_library);
-    if (!ctx->is_converted)
-        ctx->ass_track->track_type = TRACK_TYPE_ASS;
+    ctx->ass_track->track_type = TRACK_TYPE_ASS;
 
     ctx->shadow_track = ass_new_track(ctx->ass_library);
     ctx->shadow_track->PlayResX = 384;
@@ -211,9 +192,6 @@ static int init(struct sd *sd)
 #if LIBASS_VERSION >= 0x01302000
     ass_set_check_readorder(ctx->ass_track, sd->opts->sub_clear_on_seek ? 0 : 1);
 #endif
-
-    ctx->frame_fps = sd->codec->frame_based;
-    update_subtitle_speed(sd);
 
     enable_output(sd, true);
 
@@ -255,20 +233,27 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         if (!sd->opts->sub_clear_on_seek && packet->pos >= 0 &&
             check_packet_seen(sd, packet->pos))
             return;
-        if (packet->duration < 0) {
+
+        double sub_pts = 0;
+        double sub_duration = 0;
+        char **r = lavc_conv_decode(ctx->converter, packet, &sub_pts,
+                                    &sub_duration);
+        if (packet->duration < 0 || sub_duration == UINT32_MAX) {
             if (!ctx->duration_unknown) {
                 MP_WARN(sd, "Subtitle with unknown duration.\n");
                 ctx->duration_unknown = true;
             }
-            packet->duration = UNKNOWN_DURATION;
+            sub_duration = UNKNOWN_DURATION;
         }
-        char **r = lavc_conv_decode(ctx->converter, packet);
+
         for (int n = 0; r && r[n]; n++) {
             char *ass_line = r[n];
             if (sd->opts->sub_filter_SDH)
                 ass_line = filter_SDH(sd, track->event_format, 0, ass_line, 0);
             if (ass_line)
-                ass_process_data(track, ass_line, strlen(ass_line));
+                ass_process_chunk(track, ass_line, strlen(ass_line),
+                                  llrint(sub_pts * 1000),
+                                  llrint(sub_duration * 1000));
             if (sd->opts->sub_filter_SDH)
                 talloc_free(ass_line);
         }
@@ -301,7 +286,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
 static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
                           bool converted, ASS_Track *track)
 {
-    struct MPOpts *opts = sd->opts;
+    struct mp_subtitle_opts *opts = sd->opts;
     struct sd_ass_priv *ctx = sd->priv;
     ASS_Renderer *priv = ctx->ass_renderer;
 
@@ -387,8 +372,6 @@ static long long find_timestamp(struct sd *sd, double pts)
     if (pts == MP_NOPTS_VALUE)
         return 0;
 
-    pts /= priv->sub_speed;
-
     long long ts = llrint(pts * 1000);
 
     if (!sd->opts->sub_fix_timing || sd->opts->ass_style_override == 0)
@@ -452,7 +435,7 @@ static void get_bitmaps(struct sd *sd, struct mp_osd_res dim, int format,
                         double pts, struct sub_bitmaps *res)
 {
     struct sd_ass_priv *ctx = sd->priv;
-    struct MPOpts *opts = sd->opts;
+    struct mp_subtitle_opts *opts = sd->opts;
     bool no_ass = !opts->ass_enabled || ctx->on_top ||
                   opts->ass_style_override == 5;
     bool converted = ctx->is_converted || no_ass;
@@ -610,6 +593,35 @@ static char *get_text(struct sd *sd, double pts)
     return ctx->last_text;
 }
 
+static struct sd_times get_times(struct sd *sd, double pts)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    ASS_Track *track = ctx->ass_track;
+    struct sd_times res = { .start = MP_NOPTS_VALUE, .end = MP_NOPTS_VALUE };
+
+    if (pts == MP_NOPTS_VALUE || ctx->duration_unknown)
+        return res;
+
+    long long ipts = find_timestamp(sd, pts);
+
+    for (int i = 0; i < track->n_events; ++i) {
+        ASS_Event *event = track->events + i;
+        if (ipts >= event->Start && ipts < event->Start + event->Duration) {
+            double start = event->Start / 1000.0;
+            double end = event->Duration == UNKNOWN_DURATION ?
+                MP_NOPTS_VALUE : (event->Start + event->Duration) / 1000.0;
+
+            if (res.start == MP_NOPTS_VALUE || res.start > start)
+                res.start = start;
+
+            if (res.end == MP_NOPTS_VALUE || res.end < end)
+                res.end = end;
+        }
+    }
+
+    return res;
+}
+
 static void fill_plaintext(struct sd *sd, double pts)
 {
     struct sd_ass_priv *ctx = sd->priv;
@@ -679,11 +691,11 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
     switch (cmd) {
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
-        long long ts = llrint(a[0] * (1000.0 / ctx->sub_speed));
+        long long ts = llrint(a[0] * 1000.0);
         long long res = ass_step_sub(ctx->ass_track, ts, a[1]);
         if (!res)
             return false;
-        a[0] = res / (1000.0 / ctx->sub_speed);
+        a[0] += res / 1000.0;
         return true;
     }
     case SD_CTRL_SET_VIDEO_PARAMS:
@@ -691,13 +703,6 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
         return CONTROL_OK;
     case SD_CTRL_SET_TOP:
         ctx->on_top = *(bool *)arg;
-        return CONTROL_OK;
-    case SD_CTRL_SET_VIDEO_DEF_FPS:
-        ctx->video_fps = *(double *)arg;
-        update_subtitle_speed(sd);
-        return CONTROL_OK;
-    case SD_CTRL_UPDATE_SPEED:
-        update_subtitle_speed(sd);
         return CONTROL_OK;
     default:
         return CONTROL_UNKNOWN;
@@ -711,6 +716,7 @@ const struct sd_functions sd_ass = {
     .decode = decode,
     .get_bitmaps = get_bitmaps,
     .get_text = get_text,
+    .get_times = get_times,
     .control = control,
     .reset = reset,
     .select = enable_output,
@@ -720,7 +726,7 @@ const struct sd_functions sd_ass = {
 // Disgusting hack for (xy-)vsfilter color compatibility.
 static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
 {
-    struct MPOpts *opts = sd->opts;
+    struct mp_subtitle_opts *opts = sd->opts;
     struct sd_ass_priv *ctx = sd->priv;
     enum mp_csp csp = 0;
     enum mp_csp_levels levels = 0;

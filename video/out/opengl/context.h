@@ -23,6 +23,9 @@ struct ra_gl_ctx_params {
     // function or if you override it yourself.
     void (*swap_buffers)(struct ra_ctx *ctx);
 
+    // See ra_swapchain_fns.get_vsync.
+    void (*get_vsync)(struct ra_ctx *ctx, struct vo_vsync_info *info);
+
     // Set to false if the implementation follows normal GL semantics, which is
     // upside down. Set to true if it does *not*, i.e. if rendering is right
     // side up
@@ -34,10 +37,6 @@ struct ra_gl_ctx_params {
     // ra_swapchain_fns structs will entirely replace the equivalent ra_gl_ctx
     // functions in the resulting ra_swapchain.
     const struct ra_swapchain_fns *external_swapchain;
-
-    // For hwdec_vaegl.c:
-    const char *native_display_type;
-    void *native_display;
 };
 
 void ra_gl_ctx_uninit(struct ra_ctx *ctx);

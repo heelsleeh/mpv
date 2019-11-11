@@ -34,6 +34,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "misc/thread_tools.h"
 #include "stream.h"
 #include "options/m_option.h"
 #include "options/path.h"
@@ -61,14 +62,31 @@ struct priv {
     int fd;
     bool close;
     bool use_poll;
+    bool regular_file;
+    bool appending;
+    int64_t orig_size;
+    struct mp_cancel *cancel;
 };
 
-static int fill_buffer(stream_t *s, char *buffer, int max_len)
+// Total timeout = RETRY_TIMEOUT * MAX_RETRIES
+#define RETRY_TIMEOUT 0.2
+#define MAX_RETRIES 10
+
+static int64_t get_size(stream_t *s)
 {
     struct priv *p = s->priv;
+    off_t size = lseek(p->fd, 0, SEEK_END);
+    lseek(p->fd, s->pos, SEEK_SET);
+    return size == (off_t)-1 ? -1 : size;
+}
+
+static int fill_buffer(stream_t *s, void *buffer, int max_len)
+{
+    struct priv *p = s->priv;
+
 #ifndef __MINGW32__
     if (p->use_poll) {
-        int c = s->cancel ? mp_cancel_get_fd(s->cancel) : -1;
+        int c = mp_cancel_get_fd(p->cancel);
         struct pollfd fds[2] = {
             {.fd = p->fd, .events = POLLIN},
             {.fd = c, .events = POLLIN},
@@ -78,46 +96,40 @@ static int fill_buffer(stream_t *s, char *buffer, int max_len)
             return -1;
     }
 #endif
-    int r = read(p->fd, buffer, max_len);
-    return (r <= 0) ? -1 : r;
+
+    for (int retries = 0; retries < MAX_RETRIES; retries++) {
+        int r = read(p->fd, buffer, max_len);
+        if (r > 0)
+            return r;
+
+        // Try to detect and handle files being appended during playback.
+        int64_t size = get_size(s);
+        if (p->regular_file && size > p->orig_size && !p->appending) {
+            MP_WARN(s, "File is apparently being appended to, will keep "
+                    "retrying with timeouts.\n");
+            p->appending = true;
+        }
+
+        if (!p->appending || p->use_poll)
+            break;
+
+        if (mp_cancel_wait(p->cancel, RETRY_TIMEOUT))
+            break;
+    }
+
+    return 0;
 }
 
-static int write_buffer(stream_t *s, char *buffer, int len)
+static int write_buffer(stream_t *s, void *buffer, int len)
 {
     struct priv *p = s->priv;
-    int r;
-    int wr = 0;
-    while (wr < len) {
-        r = write(p->fd, buffer, len);
-        if (r <= 0)
-            return -1;
-        wr += r;
-        buffer += r;
-    }
-    return len;
+    return write(p->fd, buffer, len);
 }
 
 static int seek(stream_t *s, int64_t newpos)
 {
     struct priv *p = s->priv;
     return lseek(p->fd, newpos, SEEK_SET) != (off_t)-1;
-}
-
-static int control(stream_t *s, int cmd, void *arg)
-{
-    struct priv *p = s->priv;
-    switch (cmd) {
-    case STREAM_CTRL_GET_SIZE: {
-        off_t size = lseek(p->fd, 0, SEEK_END);
-        lseek(p->fd, s->pos, SEEK_SET);
-        if (size != (off_t)-1) {
-            *(int64_t *)arg = size;
-            return 1;
-        }
-        break;
-    }
-    }
-    return STREAM_UNSUPPORTED;
 }
 
 static void s_close(stream_t *s)
@@ -158,7 +170,8 @@ char *mp_file_get_path(void *talloc_ctx, bstr url)
 static bool check_stream_network(int fd)
 {
     struct statfs fs;
-    const char *stypes[] = { "afpfs", "nfs", "smbfs", "webdav", NULL };
+    const char *stypes[] = { "afpfs", "nfs", "smbfs", "webdav", "osxfusefs",
+                             "fuse", "fusefs.sshfs", NULL };
     if (fstatfs(fd, &fs) == 0)
         for (int i=0; stypes[i]; i++)
             if (strcmp(stypes[i], fs.f_fstypename) == 0)
@@ -178,6 +191,7 @@ static bool check_stream_network(int fd)
         0x564C      /*NCP*/,    0x6969      /*NFS*/,    0x6E667364  /*NFSD*/,
         0xAAD7AAEA  /*PANFS*/,  0x50495045  /*PIPEFS*/, 0x517B      /*SMB*/,
         0xBEEFDEAD  /*SNFS*/,   0xBACBACBC  /*VMHGFS*/, 0x7461636f  /*OCFS2*/,
+        0xFE534D42  /*SMB2*/,   0x61636673  /*ACFS*/,   0x013111A8  /*IBRIX*/,
         0
     };
     if (fstatfs(fd, &fs) == 0) {
@@ -265,12 +279,14 @@ static int open_f(stream_t *stream)
             p->fd = 1;
         }
     } else {
+        if (bstr_startswith0(bstr0(stream->url), "appending://"))
+            p->appending = true;
+
         mode_t openmode = S_IRUSR | S_IWUSR;
 #ifndef __MINGW32__
         openmode |= S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
         if (!write)
             m |= O_NONBLOCK;
-        p->use_poll = true;
 #endif
         p->fd = open(filename, m | O_BINARY, openmode);
         if (p->fd < 0) {
@@ -278,24 +294,24 @@ static int open_f(stream_t *stream)
                    filename, mp_strerror(errno));
             return STREAM_ERROR;
         }
-        struct stat st;
-        if (fstat(p->fd, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                p->use_poll = false;
-                stream->is_directory = true;
-                stream->allow_caching = false;
-                MP_INFO(stream, "This is a directory - adding to playlist.\n");
-            }
-#ifndef __MINGW32__
-            if (S_ISREG(st.st_mode)) {
-                p->use_poll = false;
-                // O_NONBLOCK has weird semantics on file locks; remove it.
-                int val = fcntl(p->fd, F_GETFL) & ~(unsigned)O_NONBLOCK;
-                fcntl(p->fd, F_SETFL, val);
-            }
-#endif
-        }
         p->close = true;
+    }
+
+    struct stat st;
+    if (fstat(p->fd, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            stream->is_directory = true;
+            MP_INFO(stream, "This is a directory - adding to playlist.\n");
+        } else if (S_ISREG(st.st_mode)) {
+            p->regular_file = true;
+#ifndef __MINGW32__
+            // O_NONBLOCK has weird semantics on file locks; remove it.
+            int val = fcntl(p->fd, F_GETFL) & ~(unsigned)O_NONBLOCK;
+            fcntl(p->fd, F_SETFL, val);
+#endif
+        } else {
+            p->use_poll = true;
+        }
     }
 
 #ifdef __MINGW32__
@@ -312,12 +328,17 @@ static int open_f(stream_t *stream)
     stream->fast_skip = true;
     stream->fill_buffer = fill_buffer;
     stream->write_buffer = write_buffer;
-    stream->control = control;
-    stream->read_chunk = 64 * 1024;
+    stream->get_size = get_size;
     stream->close = s_close;
 
     if (check_stream_network(p->fd))
         stream->streaming = true;
+
+    p->orig_size = get_size(stream);
+
+    p->cancel = mp_cancel_new(p);
+    if (stream->cancel)
+        mp_cancel_set_parent(p->cancel, stream->cancel);
 
     return STREAM_OK;
 }
@@ -325,7 +346,8 @@ static int open_f(stream_t *stream)
 const stream_info_t stream_info_file = {
     .name = "file",
     .open = open_f,
-    .protocols = (const char*const[]){ "file", "", "fd", "fdclose", NULL },
+    .protocols = (const char*const[]){ "file", "", "fd", "fdclose",
+                                       "appending", NULL },
     .can_write = true,
     .is_safe = true,
 };

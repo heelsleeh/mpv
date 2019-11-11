@@ -30,6 +30,7 @@
 #include "options/options.h"
 #include "common/common.h"
 #include "options/m_property.h"
+#include "filters/f_decoder_wrapper.h"
 #include "common/encode.h"
 
 #include "osdep/terminal.h"
@@ -39,7 +40,6 @@
 #include "stream/stream.h"
 #include "sub/osd.h"
 
-#include "video/decode/dec_video.h"
 #include "video/out/vo.h"
 
 #include "core.h"
@@ -98,7 +98,7 @@ static void term_osd_update(struct MPContext *mpctx)
 
 void term_osd_set_subs(struct MPContext *mpctx, const char *text)
 {
-    if (mpctx->video_out || !text)
+    if (mpctx->video_out || !text || !mpctx->opts->subs_rend->sub_visibility)
         text = ""; // disable
     if (strcmp(mpctx->term_osd_subs ? mpctx->term_osd_subs : "", text) == 0)
         return;
@@ -156,28 +156,12 @@ static bool is_busy(struct MPContext *mpctx)
     return !mpctx->restart_complete && mp_time_sec() - mpctx->start_timestamp > 0.3;
 }
 
-static void term_osd_print_status_lazy(struct MPContext *mpctx)
+static char *get_term_status_msg(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
-    update_window_title(mpctx, false);
-    update_vo_playback_state(mpctx);
-
-    if (!opts->use_terminal)
-        return;
-
-    if (opts->quiet || !mpctx->playback_initialized || !mpctx->playing_msg_shown)
-    {
-        term_osd_set_status_lazy(mpctx, "");
-        return;
-    }
-
-    if (opts->status_msg) {
-        char *r = mp_property_expand_escaped_string(mpctx, opts->status_msg);
-        term_osd_set_status_lazy(mpctx, r);
-        talloc_free(r);
-        return;
-    }
+    if (opts->status_msg)
+        return mp_property_expand_escaped_string(mpctx, opts->status_msg);
 
     char *line = NULL;
 
@@ -197,9 +181,9 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
     saddf(&line, ": ");
 
     // Playback position
-    sadd_hhmmssff(&line, get_playback_time(mpctx), mpctx->opts->osd_fractions);
+    sadd_hhmmssff(&line, get_playback_time(mpctx), opts->osd_fractions);
     saddf(&line, " / ");
-    sadd_hhmmssff(&line, get_time_length(mpctx), mpctx->opts->osd_fractions);
+    sadd_hhmmssff(&line, get_time_length(mpctx), opts->osd_fractions);
 
     sadd_percentage(&line, get_percent_pos(mpctx));
 
@@ -214,7 +198,6 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
             saddf(&line, " ct:%7.3f", mpctx->total_avsync_change);
     }
 
-#if HAVE_ENCODING
     double position = get_current_pos_ratio(mpctx, true);
     char lavcbuf[80];
     if (encode_lavc_getstatus(mpctx->encode_lavc_ctx, lavcbuf, sizeof(lavcbuf),
@@ -222,9 +205,7 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
     {
         // encoding stats
         saddf(&line, " %s", lavcbuf);
-    } else
-#endif
-    {
+    } else {
         // VO stats
         if (mpctx->vo_chain) {
             if (mpctx->display_sync_active) {
@@ -237,8 +218,9 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
                 talloc_free(r);
             }
             int64_t c = vo_get_drop_count(mpctx->video_out);
-            struct dec_video *d_video = mpctx->vo_chain->video_src;
-            int dropped_frames = d_video ? d_video->dropped_frames : 0;
+            struct mp_decoder_wrapper *dec = mpctx->vo_chain->track
+                                        ? mpctx->vo_chain->track->dec : NULL;
+            int dropped_frames = dec ? dec->dropped_frames : 0;
             if (c > 0 || dropped_frames > 0) {
                 saddf(&line, " Dropped: %"PRId64, c);
                 if (dropped_frames)
@@ -247,30 +229,53 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
         }
     }
 
-    if (mpctx->demuxer) {
-        struct stream_cache_info info = {0};
-        demux_stream_control(mpctx->demuxer, STREAM_CTRL_GET_CACHE_INFO, &info);
-        if (info.size > 0 || mpctx->demuxer->is_network) {
-            saddf(&line, " Cache: ");
+    if (mpctx->demuxer && demux_is_network_cached(mpctx->demuxer)) {
+        saddf(&line, " Cache: ");
 
-            struct demux_ctrl_reader_state s = {.ts_duration = -1};
-            demux_control(mpctx->demuxer, DEMUXER_CTRL_GET_READER_STATE, &s);
+        struct demux_reader_state s;
+        demux_get_reader_state(mpctx->demuxer, &s);
 
-            if (s.ts_duration < 0) {
-                saddf(&line, "???");
+        if (s.ts_duration < 0) {
+            saddf(&line, "???");
+        } else if (s.ts_duration < 10) {
+            saddf(&line, "%2.1fs", s.ts_duration);
+        } else {
+            saddf(&line, "%2ds", (int)s.ts_duration);
+        }
+        int64_t cache_size = s.fw_bytes;
+        if (cache_size > 0) {
+            if (cache_size >= 1024 * 1024) {
+                saddf(&line, "/%lldMB", (long long)(cache_size / 1024 / 1024));
             } else {
-                saddf(&line, "%2ds", (int)s.ts_duration);
-            }
-            int64_t cache_size = s.fw_bytes + info.fill;
-            if (cache_size > 0) {
-                if (cache_size >= 1024 * 1024) {
-                    saddf(&line, "+%lldMB", (long long)(cache_size / 1024 / 1024));
-                } else {
-                    saddf(&line, "+%lldKB", (long long)(cache_size / 1024));
-                }
+                saddf(&line, "/%lldKB", (long long)(cache_size / 1024));
             }
         }
     }
+
+    return line;
+}
+
+static void term_osd_print_status_lazy(struct MPContext *mpctx)
+{
+    struct MPOpts *opts = mpctx->opts;
+
+    update_window_title(mpctx, false);
+    update_vo_playback_state(mpctx);
+
+    if (!opts->use_terminal)
+        return;
+
+    if (opts->quiet || !mpctx->playback_initialized ||
+        !mpctx->playing_msg_shown || mpctx->stop_play)
+    {
+        if (!mpctx->playing || mpctx->stop_play) {
+            mp_msg_flush_status_line(mpctx->log);
+            term_osd_set_status_lazy(mpctx, "");
+        }
+        return;
+    }
+
+    char *line = get_term_status_msg(mpctx);
 
     if (opts->term_osd_bar) {
         saddf(&line, "\n");
@@ -279,7 +284,6 @@ static void term_osd_print_status_lazy(struct MPContext *mpctx)
         add_term_osd_bar(mpctx, &line, w);
     }
 
-    // end
     term_osd_set_status_lazy(mpctx, line);
     talloc_free(line);
 }
@@ -350,26 +354,22 @@ static void update_osd_bar(struct MPContext *mpctx, int type,
 
 void set_osd_bar_chapters(struct MPContext *mpctx, int type)
 {
-    struct MPOpts *opts = mpctx->opts;
     if (mpctx->osd_progbar.type != type)
         return;
 
     mpctx->osd_progbar.num_stops = 0;
     double len = get_time_length(mpctx);
     if (len > 0) {
-        double ab_loop_start_time = get_ab_loop_start_time(mpctx);
-        if (opts->ab_loop[0] != MP_NOPTS_VALUE ||
-            (ab_loop_start_time != MP_NOPTS_VALUE &&
-               opts->ab_loop[1] != MP_NOPTS_VALUE))
-        {
-            MP_TARRAY_APPEND(mpctx, mpctx->osd_progbar.stops,
-                        mpctx->osd_progbar.num_stops, ab_loop_start_time / len);
+        // Always render the loop points, even if they're incomplete.
+        double ab[2];
+        bool valid = get_ab_loop_times(mpctx, ab);
+        for (int n = 0; n < 2; n++) {
+            if (ab[n] != MP_NOPTS_VALUE) {
+                MP_TARRAY_APPEND(mpctx, mpctx->osd_progbar.stops,
+                                 mpctx->osd_progbar.num_stops, ab[n] / len);
+            }
         }
-        if (opts->ab_loop[1] != MP_NOPTS_VALUE) {
-            MP_TARRAY_APPEND(mpctx, mpctx->osd_progbar.stops,
-                        mpctx->osd_progbar.num_stops, opts->ab_loop[1] / len);
-        }
-        if (mpctx->osd_progbar.num_stops == 0) {
+        if (!valid) {
             int num = get_chapter_count(mpctx);
             for (int n = 0; n < num; n++) {
                 double time = chapter_start_time(mpctx, n);

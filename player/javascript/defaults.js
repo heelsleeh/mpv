@@ -17,7 +17,7 @@ function new_cache() {
 }
 
 /**********************************************************************
- *  event handlers, property observers, client messages, hooks
+ *  event handlers, property observers, idle, client messages, hooks, async
  *********************************************************************/
 var ehandlers = new_cache() // items of event-name: array of {maybe cb: fn}
 
@@ -51,6 +51,31 @@ function dispatch_event(e) {
             if (cb)                   // could remove cb from some items
                 cb(e);
         }
+    }
+}
+
+//  ----- idle observers -----
+var iobservers = [],  // array of callbacks
+    ideleted = false;
+
+mp.register_idle = function(fn) {
+    iobservers.push(fn);
+}
+
+mp.unregister_idle = function(fn) {
+    iobservers.forEach(function(f, i) {
+        if (f == fn)
+             delete iobservers[i];  // -> same length but [more] sparse
+    });
+    ideleted = true;
+}
+
+function notify_idle_observers() {
+    // forEach and filter skip deleted items and newly added items
+    iobservers.forEach(function(f) { f() });
+    if (ideleted) {
+        iobservers = iobservers.filter(function() { return true });
+        ideleted = false;
     }
 }
 
@@ -98,22 +123,51 @@ function dispatch_message(ev) {
 }
 
 //  ----- hooks -----
-var next_hid = 1,
-    hooks = new_cache();  // items of id: fn
+var hooks = [];  // array of callbacks, id is index+1
 
-function hook_run(id, cont) {
-    var cb = hooks[id];
+function run_hook(ev) {
+    var cb = ev.id > 0 && hooks[ev.id - 1];
     if (cb)
         cb();
-    mp.commandv("hook-ack", cont);
+    mp._hook_continue(ev.hook_id);
 }
 
 mp.add_hook = function add_hook(name, pri, fn) {
-    if (next_hid == 1)  // doesn't really matter if we do it once or always
-        mp.register_script_message("hook_run", hook_run);
-    var id = next_hid++;
-    hooks[id] = fn;
-    return mp.commandv("hook-add", name, id, pri);
+    hooks.push(fn);
+    // 50 (scripting docs default priority) maps to 0 (default in C API docs)
+    return mp._hook_add(name, pri - 50, hooks.length);
+}
+
+// ----- async commands -----
+var async_callbacks = new_cache();  // items of id: fn
+var async_next_id = 1;
+
+mp.command_native_async = function command_native_async(node, cb) {
+    var id = async_next_id++;
+    cb = cb || function dummy() {};
+    if (!mp._command_native_async(id, node)) {
+        var le = mp.last_error();
+        setTimeout(cb, 0, false, undefined, le);  /* callback async */
+        mp._set_last_error(le);
+        return undefined;
+    }
+    async_callbacks[id] = cb;
+    return id;
+}
+
+function async_command_handler(ev) {
+    var cb = async_callbacks[ev.id];
+    delete async_callbacks[ev.id];
+    if (ev.error)
+        cb(false, undefined, ev.error);
+    else
+        cb(true, ev.result, "");
+}
+
+mp.abort_async_command = function abort_async_command(id) {
+    // cb will be invoked regardless, possibly with the abort result
+    if (async_callbacks[id])
+        mp._abort_async_command(id);
 }
 
 /**********************************************************************
@@ -252,6 +306,10 @@ g.clearTimeout = g.clearInterval = function(id) {
 // arr: ordered timers array. ret: -1: no timers, 0: due, positive: ms to wait
 function peek_wait(arr) {
     return arr.length ? Math.max(0, arr[arr.length - 1].when - now()) : -1;
+}
+
+function peek_timers_wait() {
+    return peek_wait(timers);  // must not be called while in process_timers
 }
 
 // Callback all due non-canceled timers which were inserted before calling us.
@@ -420,6 +478,58 @@ function new_require(base_id) {
 g.require = new_require(SCRIPTDIR_META + "/" + main_script[1]);
 
 /**********************************************************************
+ *  mp.options
+ *********************************************************************/
+function read_options(opts, id) {
+    id = String(typeof id != "undefined" ? id : mp.get_script_name());
+    mp.msg.debug("reading options for " + id);
+
+    var conf, fname = "~~/script-opts/" + id + ".conf";
+    try {
+        conf = mp.utils.read_file(fname);
+    } catch (e) {
+        mp.msg.verbose(fname + " not found.");
+    }
+
+    // data as config file lines array, or empty array
+    var data = conf ? conf.replace(/\r\n/g, "\n").split("\n") : [],
+        conf_len = data.length;  // before we append script-opts below
+
+    // Append relevant script-opts as <key-sans-id>=<value> to data
+    var sopts = mp.get_property_native("options/script-opts"),
+        prefix = id + "-";
+    for (var key in sopts) {
+        if (key.indexOf(prefix) == 0)
+            data.push(key.substring(prefix.length) + "=" + sopts[key]);
+    }
+
+    // Update opts from data
+    data.forEach(function(line, i) {
+        if (line[0] == "#" || line.trim() == "")
+            return;
+
+        var key = line.substring(0, line.indexOf("=")),
+            val = line.substring(line.indexOf("=") + 1),
+            type = typeof opts[key],
+            info = i < conf_len ? fname + ":" + (i + 1)  // 1-based line number
+                                : "script-opts:" + prefix + key;
+
+        if (!opts.hasOwnProperty(key))
+            mp.msg.warn(info, "Ignoring unknown key '" + key + "'");
+        else if (type == "string")
+            opts[key] = val;
+        else if (type == "boolean" && (val == "yes" || val == "no"))
+            opts[key] = (val == "yes");
+        else if (type == "number" && val.trim() != "" && !isNaN(val))
+            opts[key] = Number(val);
+        else
+            mp.msg.error(info, "Error: can't convert '" + val + "' to " + type);
+    });
+}
+
+mp.options = { read_options: read_options };
+
+/**********************************************************************
  *  various
  *********************************************************************/
 g.print = mp.msg.info;  // convenient alias
@@ -429,6 +539,8 @@ mp.get_time = function() { return mp.get_time_ms() / 1000 };
 mp.utils.getcwd = function() { return mp.get_property("working-directory") };
 mp.dispatch_event = dispatch_event;
 mp.process_timers = process_timers;
+mp.notify_idle_observers = notify_idle_observers;
+mp.peek_timers_wait = peek_timers_wait;
 
 mp.get_opt = function(key, def) {
     var v = mp.get_property_native("options/script-opts")[key];
@@ -438,6 +550,25 @@ mp.get_opt = function(key, def) {
 mp.osd_message = function osd_message(text, duration) {
     mp.commandv("show_text", text, Math.round(1000 * (duration || -1)));
 }
+
+mp.utils.subprocess = function subprocess(t) {
+    var cmd = { name: "subprocess", capture_stdout: true };
+    var new_names = { cancellable: "playback_only", max_size: "capture_size" };
+    for (var k in t)
+        cmd[new_names[k] || k] = t[k];
+
+    var rv = mp.command_native(cmd);
+    if (mp.last_error())  /* typically on missing/incorrect args */
+        rv = { error_string: mp.last_error(), status: -1 };
+    if (rv.error_string)
+        rv.error = rv.error_string;
+    return rv;
+}
+
+mp.utils.subprocess_detached = function subprocess_detached(t) {
+    return mp.commandv.apply(null, ["run"].concat(t.args));
+}
+
 
 // ----- dump: like print, but expands objects/arrays recursively -----
 function replacer(k, v) {
@@ -454,7 +585,7 @@ function replacer(k, v) {
 
 function obj2str(v) {
     try {  // can process objects more than once, but throws on cycles
-        return JSON.stringify(v, replacer, 2);
+        return JSON.stringify(v, replacer.bind(null), 2);
     } catch (e) { // simple safe: exclude visited objects, even if not cyclic
         return JSON.stringify(v, replacer.bind([]), 2);
     }
@@ -476,18 +607,24 @@ mp.keep_running = true;
 g.exit = function() { mp.keep_running = false };  // user-facing too
 mp.register_event("shutdown", g.exit);
 mp.register_event("property-change", notify_observer);
+mp.register_event("hook", run_hook);
+mp.register_event("command-reply", async_command_handler);
 mp.register_event("client-message", dispatch_message);
 mp.register_script_message("key-binding", dispatch_key_binding);
 
 g.mp_event_loop = function mp_event_loop() {
     var wait = 0;  // seconds
-    do {  // distapch events as long as they arrive, then do the timers
+    do {  // distapch events as long as they arrive, then do the timers/idle
         var e = mp.wait_event(wait);
         if (e.event != "none") {
             dispatch_event(e);
             wait = 0;  // poll the next one
         } else {
             wait = process_timers() / 1000;
+            if (wait != 0) {
+                notify_idle_observers();  // can add timers -> recalculate wait
+                wait = peek_timers_wait() / 1000;
+            }
         }
     } while (mp.keep_running);
 };

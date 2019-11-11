@@ -58,6 +58,10 @@ Ctrl+LEFT and Ctrl+RIGHT
     Seek to the previous/next subtitle. Subject to some restrictions and
     might not always work; see ``sub-seek`` command.
 
+Ctrl+Shift+Left and Ctrl+Shift+Right
+    Adjust subtitle delay so that the next or previous subtitle is displayed
+    now. This is especially useful to sync subtitles to audio.
+
 [ and ]
     Decrease/increase current playback speed by 10%.
 
@@ -66,6 +70,17 @@ Ctrl+LEFT and Ctrl+RIGHT
 
 BACKSPACE
     Reset playback speed to normal.
+
+Shift+BACKSPACE
+    Undo the last seek. This works only if the playlist entry was not changed.
+    Hitting it a second time will go back to the original position.
+    See ``revert-seek`` command for details.
+
+Shift+Ctrl+BACKSPACE
+    Mark the current position. This will then be used by ``Shift+BACKSPACE``
+    as revert position (once you seek back, the marker will be reset). You can
+    use this to seek around in the file and then return to the exact position
+    where you left off.
 
 < and >
     Go backward/forward in the playlist.
@@ -115,8 +130,9 @@ ESC
 T
     Toggle stay-on-top (see also ``--ontop``).
 
-w and e
-    Decrease/increase pan-and-scan range.
+w and W
+    Decrease/increase pan-and-scan range. The ``e`` key does the same as
+    ``W`` currently, but use is discouraged.
 
 o (also P)
     Show progression bar, elapsed time and total duration on the OSD.
@@ -130,8 +146,9 @@ v
 j and J
     Cycle through the available subtitles.
 
-x and z
-    Adjust subtitle delay by +/- 0.1 seconds.
+z and Z
+    Adjust subtitle delay by +/- 0.1 seconds. The ``x`` key does the same as
+    ``Z`` currently, but use is discouraged.
 
 l
     Set/clear A-B loop points. See ``ab-loop`` command for details.
@@ -151,8 +168,9 @@ V
     Toggle subtitle VSFilter aspect compatibility mode. See
     ``--sub-ass-vsfilter-aspect-compat`` for more info.
 
-r and t
-    Move subtitles up/down.
+r and R
+    Move subtitles up/down. The ``t`` key does the same as ``R`` currently, but
+    use is discouraged.
 
 s
     Take a screenshot.
@@ -180,8 +198,33 @@ d
 A
     Cycle aspect ratio override.
 
+Ctrl h
+    Toggle hardware video decoding on/off.
+
+Alt+LEFT, Alt+RIGHT, Alt+UP, Alt+DOWN
+    Move the video rectangle (panning).
+
+Alt + and Alt -
+    Combining ``Alt`` with the ``+`` or ``-`` keys changes video zoom.
+
+Alt+BACKSPACE
+    Reset the pan/zoom settings.
+
+F8
+    Show the playlist and the current position in it (useful only if a UI window
+    is used, broken on the terminal).
+
+F9
+    Show the list of audio and subtitle streams (useful only if a UI window  is
+    used, broken on the terminal).
+
+i and I
+    Show/toggle an overlay displaying statistics about the currently playing
+    file such as codec, framerate, number of dropped frames and so on. See
+    `STATS`_ for more information.
+
 (The following keys are valid only when using a video output that supports the
-corresponding adjustment, or the software equalizer (``--vf=eq``).)
+corresponding adjustment.)
 
 1 and 2
     Adjust contrast.
@@ -225,10 +268,19 @@ in the mpv git repository.
 Mouse Control
 -------------
 
-button 3 and button 4
-    Seek backward/forward 1 minute.
+Left double click
+    Toggle fullscreen on/off.
 
-button 5 and button 6
+Right click
+    Toggle pause on/off.
+
+Forward/Back button
+    Skip to next/previous entry in playlist.
+
+Wheel up/down
+    Seek forward/backward 10 seconds.
+
+Wheel left/right
     Decrease/increase volume.
 
 
@@ -435,6 +487,7 @@ Suffix        Meaning
 -del          Delete an existing item by integer index
 -pre          Prepend 1 or more items
 -set          Set a list of items
+-toggle       Append an item, or remove if if it already exists
 ============= ===============================================
 
 Although some operations allow specifying multiple ``,``-separated items, using
@@ -446,47 +499,10 @@ Some options (like ``--sub-file``, ``--audio-file``, ``--glsl-shader``) are
 aliases for the proper option with ``-append`` action. For example,
 ``--sub-file`` is an alias for ``--sub-files-append``.
 
-Playing DVDs
-------------
+Some options only support a subset of the above.
 
-DVDs can be played with the ``dvd://[title]`` syntax. The optional
-title specifier is a number which selects between separate video
-streams on the DVD. If no title is given (``dvd://``) then the longest
-title is selected automatically by the library. This is usually what
-you want. mpv does not support DVD menus.
-
-DVDs which have been copied on to a hard drive or other mounted
-filesystem (by e.g. the ``dvdbackup`` tool) are accommodated by
-specifying the path to the local copy: ``--dvd-device=PATH``.
-Alternatively, running ``mpv PATH`` should auto-detect a DVD directory
-tree and play the longest title.
-
-.. note:: DVD library choices
-
-    mpv uses a different default DVD library than MPlayer. MPlayer
-    uses libdvdread by default, and mpv uses libdvdnav by default.
-    Both libraries are developed in parallel, but libdvdnav is
-    intended to support more sophisticated DVD features such as menus
-    and multi-angle playback. mpv uses libdvdnav for files specified
-    as either ``dvd://...`` or ``dvdnav://...``. To use libdvdread,
-    which will produce behavior more like MPlayer, specify
-    ``dvdread://...`` instead. Some users have experienced problems
-    when using libdvdnav, in which playback gets stuck in a DVD menu
-    stream. These problems are reported to go away when auto-selecting
-    the title (``dvd://`` rather than ``dvd://1``) or when using
-    libdvdread (e.g. ``dvdread://0``). There are also outstanding bugs
-    in libdvdnav with seeking backwards and forwards in a video
-    stream. Specify ``dvdread://...`` to fix such problems.
-
-.. note:: DVD subtitles
-    
-    DVDs use image-based subtitles. Image subtitles are implemented as
-    a bitmap video stream which can be superimposed over the main
-    movie. mpv's subtitle styling and positioning options and keyboard
-    shortcuts generally do not work with image-based subtitles.
-    Exceptions include options like ``--stretch-dvd-subs`` and
-    ``--stretch-image-subs-to-screen``.
-
+Options of this type can be changed at runtime using the ``change-list``
+command, which takes the suffix as separate operation parameter.
 
 CONFIGURATION FILES
 ===================
@@ -567,6 +583,11 @@ description (shown by ``--profile=help``) can be defined with the
 ``profile-desc`` option. To end the profile, start another one or use the
 profile name ``default`` to continue with normal options.
 
+You can list profiles with ``--profile=help``, and show the contents of a
+profile with ``--show-profile=<name>`` (replace ``<name>`` with the profile
+name). You can apply profiles on start with the ``--profile=<name>`` option,
+or at runtime with the ``apply-profile <name>`` command.
+
 .. admonition:: Example mpv config file with profiles
 
     ::
@@ -576,7 +597,8 @@ profile name ``default`` to continue with normal options.
 
         # a profile that can be enabled with --profile=big-cache
         [big-cache]
-        cache=123400
+        cache=yes
+        demuxer-max-bytes=123400KiB
         demuxer-readahead-secs=20
 
         [slow]
@@ -603,12 +625,8 @@ Some profiles are loaded automatically. The following example demonstrates this:
 
     ::
 
-        [protocol.dvd]
-        profile-desc="profile for dvd:// streams"
-        alang=en
-
-        [extension.flv]
-        profile-desc="profile for .flv files"
+        [extension.mkv]
+        profile-desc="profile for .mkv files"
         vf=flip
 
 The profile name follows the schema ``type.name``, where type can be
@@ -681,12 +699,49 @@ listed.
   to the display as well, e.g.: ``Dropped: 4/34``. This happens only if
   decoder frame dropping is enabled with the ``--framedrop`` options.
   (``drop-frame-count`` property.)
-- Cache state, e.g. ``Cache:  2s+134KB``. Visible if the stream cache is enabled.
+- Cache state, e.g. ``Cache:  2s/134KB``. Visible if the stream cache is enabled.
   The first value shows the amount of video buffered in the demuxer in seconds,
-  the second value shows the sum of the demuxer forward cache size and the
-  *additional* data buffered in the stream cache in kilobytes.
-  (``demuxer-cache-duration``, ``demuxer-cache-state``, ``cache-used``
-  properties.)
+  the second value shows the estimated size of the buffered amount in kilobytes.
+  (``demuxer-cache-duration`` and ``demuxer-cache-state`` properties.)
+
+
+LOW LATENCY PLAYBACK
+====================
+
+mpv is optimized for normal video playback, meaning it actually tries to buffer
+as much data as it seems to make sense. This will increase latency. Reducing
+latency is possible only by specifically disabling features which increase
+latency.
+
+The builtin ``low-latency`` profile tries to apply some of the options which can
+reduce latency. You can use  ``--profile=low-latency`` to apply all of them. You
+can list the contents with ``--show-profile=low-latency`` (some of the options
+are quite obscure, and may change every mpv release).
+
+Be aware that some of the options can reduce playback quality.
+
+Most latency is actually caused by inconvenient timing behavior. You can disable
+this with ``--untimed``, but it will likely break, unless the stream has no
+audio, and the input feeds data to the player at a constant rate.
+
+Another common problem is with MJPEG streams. These do not signal the correct
+framerate. Using ``--untimed`` or ``--no-correct-pts --fps=60`` might help.
+
+For livestreams, data can build up due to pausing the stream, due to slightly
+lower playback rate, or "buffering" pauses. If the demuxer cache is enabled,
+these can be skipped manually. The experimental ``drop-buffers`` command can
+be used to discard any buffered data, though it's very disruptive.
+
+In some cases, manually tuning TCP buffer sizes and such can help to reduce
+latency.
+
+Additional options that can be tried:
+
+- ``--opengl-glfinish=yes``, can reduce buffering in the graphics driver
+- ``--opengl-swapinterval=0``, same
+- ``--vo=xv``, same
+- without audio ``--framedrop=no --speed=1.01`` may help for live sources
+  (results can be mixed)
 
 
 PROTOCOLS
@@ -708,10 +763,10 @@ PROTOCOLS
 
 ``ytdl://...``
 
-    By default, the youtube-dl hook script (enabled by default for mpv CLI)
-    only looks at http URLs. Prefixing an URL with ``ytdl://`` forces it to
-    be always processed by the script. This can also be used to invoke special
-    youtube-dl functionality like playing a video by ID or invoking search.
+    By default, the youtube-dl hook script only looks at http(s) URLs. Prefixing
+    an URL with ``ytdl://`` forces it to be always processed by the script. This
+    can also be used to invoke special youtube-dl functionality like playing a
+    video by ID or invoking search.
 
     Keep in mind that you can't pass youtube-dl command line options by this,
     and you have to use ``--ytdl-raw-options`` instead.
@@ -726,39 +781,24 @@ PROTOCOLS
 
 ``bd://[title][/device]`` ``--bluray-device=PATH``
 
-    Play a Blu-ray disc. Currently, this does not accept ISO files. Instead,
-    you must mount the ISO file as filesystem, and point ``--bluray-device``
-    to the mounted directory directly.
+    Play a Blu-ray disc. Since libbluray 1.0.1, you can read from ISO files
+    by passing them to ``--bluray-device``.
 
     ``title`` can be: ``longest`` or ``first`` (selects the default
     playlist); ``mpls/<number>`` (selects <number>.mpls playlist);
-    ``<number>`` (select playlist with the same index). You can list
-    the available playlists with ``--msg-level=bd=v``.
+    ``<number>`` (select playlist with the same index). mpv will list
+    the available playlists on loading.
 
     ``bluray://`` is an alias.
 
-``dvd://[title|[starttitle]-endtitle][/device]`` ``--dvd-device=PATH``
+``dvd://[title][/device]`` ``--dvd-device=PATH``
 
     Play a DVD. DVD menus are not supported. If no title is given, the longest
-    title is auto-selected.
+    title is auto-selected. Without ``--dvd-device``, it will probably try
+    to open an actual optical drive, if available and implemented for the OS.
 
     ``dvdnav://`` is an old alias for ``dvd://`` and does exactly the same
     thing.
-
-``dvdread://...:``
-
-    Play a DVD using the old libdvdread code. This is what MPlayer and
-    older mpv versions use for ``dvd://``. Use is discouraged. It's
-    provided only for compatibility and for transition, and to work
-    around outstanding dvdnav bugs (see "DVD library choices" above).
-
-``tv://[channel][/input_id]`` ``--tv-...``
-
-    Analogue TV via V4L. Also useful for webcams. (Linux only.)
-
-``pvr://`` ``--pvr-...``
-
-    PVR. (Linux only.)
 
 ``dvb://[cardnumber@]channel`` ``--dvbin-...``
 
@@ -783,9 +823,17 @@ PROTOCOLS
     demuxer name, and ``options`` is the (pseudo-)filename passed to the
     demuxer.
 
-    For example, ``mpv av://lavfi:mandelbrot`` makes use of the libavfilter
-    wrapper included in libavdevice, and will use the ``mandelbrot`` source
-    filter to generate input data.
+    .. admonition:: Example
+
+        ::
+
+            mpv av://v4l2:/dev/video0 --profile=low-latency --untimed
+
+        This plays video from the first v4l input with nearly the lowest latency
+        possible. It's a good replacement for the removed ``tv://`` input.
+        Using ``--untimed`` is a hack to output a captured frame immediately,
+        instead of respecting the input framerate. (There may be better ways to
+        handle this in the future.)
 
     ``avdevice://`` is an alias.
 
@@ -795,10 +843,25 @@ PROTOCOLS
     ``PATH`` itself should start with a third ``/`` to make the path an
     absolute path.
 
+``appending://PATH``
+
+    Play a local file, but assume it's being appended to. This is useful for
+    example for files that are currently being downloaded to disk. This will
+    block playback, and stop playback only if no new data was appended after
+    a timeout of about 2 seconds.
+
+    Using this is still a bit of a bad idea, because there is no way to detect
+    if a file is actually being appended, or if it's still written. If you're
+    trying to play the  output of some program, consider using a pipe
+    (``something | mpv -``). If it really has to be a file on disk, use tail to
+    make it wait forever, e.g. ``tail -f -c +0 file.mkv | mpv -``.
+
 ``fd://123``
 
     Read data from the given file descriptor (for example 123). This is similar
     to piping data to stdin via ``-``, but can use an arbitrary file descriptor.
+    mpv may modify some file descriptor properties when the stream layer "opens"
+    it.
 
 ``fdclose://123``
 
@@ -920,7 +983,11 @@ behavior of mpv.
     of ``--v`` options passed to the command line.
 
 ``MPV_LEAK_REPORT``
-    If set to ``1``, enable internal talloc leak reporting.
+    If set to ``1``, enable internal talloc leak reporting. If set to another
+    value, disable leak reporting. If unset, use the default, which normally is
+    ``0``. If mpv was built with ``--enable-ta-leak-report``, the default is
+    ``1``. If leak reporting was disabled at compile time (``NDEBUG`` in
+    custom ``CFLAGS``), this environment variable is ignored.
 
 ``LADSPA_PATH``
     Specifies the search path for LADSPA plugins. If it is unset, fully
@@ -1072,7 +1139,7 @@ For Windows-specifics, see `FILES ON WINDOWS`_ section.
     ``--write-filename-in-watch-later-config`` option, and the player will
     add the media filename to the contents of the resume config file.
 
-``~/.config/mpv/lua-settings/osc.conf``
+``~/.config/mpv/script-opts/osc.conf``
     This is loaded by the OSC script. See the `ON SCREEN CONTROLLER`_ docs
     for details.
 

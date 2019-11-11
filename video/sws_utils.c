@@ -27,14 +27,18 @@
 #include "sws_utils.h"
 
 #include "common/common.h"
+#include "options/m_config.h"
 #include "options/m_option.h"
 #include "video/mp_image.h"
 #include "video/img_format.h"
 #include "fmt-conversion.h"
 #include "csputils.h"
 #include "common/msg.h"
-#include "video/filter/vf.h"
 #include "osdep/endian.h"
+
+#if HAVE_ZIMG
+#include "zimg.h"
+#endif
 
 //global sws_flags from the command line
 struct sws_opts {
@@ -45,6 +49,9 @@ struct sws_opts {
     int chr_hshift;
     float chr_sharpen;
     float lum_sharpen;
+    int fast;
+    int bitexact;
+    int zimg;
 };
 
 #define OPT_BASE_STRUCT struct sws_opts
@@ -68,25 +75,30 @@ const struct m_sub_options sws_conf = {
         OPT_INT("chs", chr_hshift, 0),
         OPT_FLOATRANGE("ls", lum_sharpen, 0, -100.0, 100.0),
         OPT_FLOATRANGE("cs", chr_sharpen, 0, -100.0, 100.0),
+        OPT_FLAG("fast", fast, 0),
+        OPT_FLAG("bitexact", bitexact, 0),
+        OPT_FLAG("allow-zimg", zimg, 0),
         {0}
     },
     .size = sizeof(struct sws_opts),
     .defaults = &(const struct sws_opts){
-        .scaler = SWS_BICUBIC,
+        .scaler = SWS_LANCZOS,
     },
 };
 
 // Highest quality, but also slowest.
-const int mp_sws_hq_flags = SWS_LANCZOS | SWS_FULL_CHR_H_INT |
-                            SWS_FULL_CHR_H_INP | SWS_ACCURATE_RND |
-                            SWS_BITEXACT;
+static const int mp_sws_hq_flags = SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP |
+                                   SWS_ACCURATE_RND;
 
 // Fast, lossy.
 const int mp_sws_fast_flags = SWS_BILINEAR;
 
 // Set ctx parameters to global command line flags.
-void mp_sws_set_from_cmdline(struct mp_sws_context *ctx, struct sws_opts *opts)
+static void mp_sws_update_from_cmdline(struct mp_sws_context *ctx)
 {
+    m_config_cache_update(ctx->opts_cache);
+    struct sws_opts *opts = ctx->opts_cache->opts;
+
     sws_freeFilter(ctx->src_filter);
     ctx->src_filter = sws_getDefaultFilter(opts->lum_gblur, opts->chr_gblur,
                                            opts->lum_sharpen, opts->chr_sharpen,
@@ -95,6 +107,12 @@ void mp_sws_set_from_cmdline(struct mp_sws_context *ctx, struct sws_opts *opts)
 
     ctx->flags = SWS_PRINT_INFO;
     ctx->flags |= opts->scaler;
+    if (!opts->fast)
+        ctx->flags |= mp_sws_hq_flags;
+    if (opts->bitexact)
+        ctx->flags |= SWS_BITEXACT;
+
+    ctx->allow_zimg = opts->zimg;
 }
 
 bool mp_sws_supported_format(int imgfmt)
@@ -103,6 +121,21 @@ bool mp_sws_supported_format(int imgfmt)
 
     return av_format != AV_PIX_FMT_NONE && sws_isSupportedInput(av_format)
         && sws_isSupportedOutput(av_format);
+}
+
+bool mp_sws_supports_formats(struct mp_sws_context *ctx,
+                             int imgfmt_out, int imgfmt_in)
+{
+#if HAVE_ZIMG
+    if (ctx->allow_zimg) {
+        if (mp_zimg_supports_in_format(imgfmt_in) &&
+            mp_zimg_supports_out_format(imgfmt_out))
+            return true;
+    }
+#endif
+
+    return sws_isSupportedInput(imgfmt2pixfmt(imgfmt_in)) &&
+           sws_isSupportedOutput(imgfmt2pixfmt(imgfmt_out));
 }
 
 static int mp_csp_to_sws_colorspace(enum mp_csp csp)
@@ -122,7 +155,9 @@ static bool cache_valid(struct mp_sws_context *ctx)
            ctx->flags == old->flags &&
            ctx->brightness == old->brightness &&
            ctx->contrast == old->contrast &&
-           ctx->saturation == old->saturation;
+           ctx->saturation == old->saturation &&
+           ctx->allow_zimg == old->allow_zimg &&
+           (!ctx->opts_cache || !m_config_cache_update(ctx->opts_cache));
 }
 
 static void free_mp_sws(void *p)
@@ -148,7 +183,30 @@ struct mp_sws_context *mp_sws_alloc(void *talloc_ctx)
         .cached = talloc_zero(ctx, struct mp_sws_context),
     };
     talloc_set_destructor(ctx, free_mp_sws);
+
+#if HAVE_ZIMG
+    ctx->zimg = mp_zimg_alloc();
+    talloc_steal(ctx, ctx->zimg);
+#endif
+
     return ctx;
+}
+
+// Enable auto-update of parameters from command line. Don't try to set custom
+// options (other than possibly .src/.dst), because they might be overwritten
+// if the user changes any options.
+void mp_sws_enable_cmdline_opts(struct mp_sws_context *ctx, struct mpv_global *g)
+{
+    if (ctx->opts_cache)
+        return;
+
+    ctx->opts_cache = m_config_cache_alloc(ctx, g, &sws_conf);
+    ctx->force_reload = true;
+    mp_sws_update_from_cmdline(ctx);
+
+#if HAVE_ZIMG
+    mp_zimg_enable_cmdline_opts(ctx->zimg, g);
+#endif
 }
 
 // Reinitialize (if needed) - return error code.
@@ -165,18 +223,33 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
     if (cache_valid(ctx))
         return 0;
 
+    if (ctx->opts_cache)
+        mp_sws_update_from_cmdline(ctx);
+
     sws_freeContext(ctx->sws);
+    ctx->sws = NULL;
+    ctx->zimg_ok = false;
+
+#if HAVE_ZIMG
+    if (ctx->allow_zimg) {
+        ctx->zimg->log = ctx->log;
+        ctx->zimg->src = *src;
+        ctx->zimg->dst = *dst;
+        if (mp_zimg_config(ctx->zimg)) {
+            ctx->zimg_ok = true;
+            MP_VERBOSE(ctx, "Using zimg.\n");
+            goto success;
+        }
+        MP_WARN(ctx, "Not using zimg, falling back to swscale.\n");
+    }
+#endif
+
     ctx->sws = sws_alloc_context();
     if (!ctx->sws)
         return -1;
 
     mp_image_params_guess_csp(src); // sanitize colorspace/colorlevels
     mp_image_params_guess_csp(dst);
-
-    struct mp_imgfmt_desc src_fmt = mp_imgfmt_get_desc(src->imgfmt);
-    struct mp_imgfmt_desc dst_fmt = mp_imgfmt_get_desc(dst->imgfmt);
-    if (!src_fmt.id || !dst_fmt.id)
-        return -1;
 
     enum AVPixelFormat s_fmt = imgfmt2pixfmt(src->imgfmt);
     if (s_fmt == AV_PIX_FMT_NONE || sws_isSupportedInput(s_fmt) < 1) {
@@ -197,12 +270,6 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
 
     int d_csp = mp_csp_to_sws_colorspace(dst->color.space);
     int d_range = dst->color.levels == MP_CSP_LEVELS_PC;
-
-    // Work around libswscale bug #1852 (fixed in ffmpeg commit 8edf9b1fa):
-    // setting range flags for RGB gives random bogus results.
-    // Newer libswscale always ignores range flags for RGB.
-    s_range = s_range && (src_fmt.flags & MP_IMGFLAG_YUV);
-    d_range = d_range && (dst_fmt.flags & MP_IMGFLAG_YUV);
 
     av_opt_set_int(ctx->sws, "sws_flags", ctx->flags, 0);
 
@@ -242,6 +309,7 @@ int mp_sws_reinit(struct mp_sws_context *ctx)
     if (sws_init_context(ctx->sws, ctx->src_filter, ctx->dst_filter) < 0)
         return -1;
 
+success:
     ctx->force_reload = false;
     *ctx->cached = *ctx;
     return 1;
@@ -262,6 +330,11 @@ int mp_sws_scale(struct mp_sws_context *ctx, struct mp_image *dst,
         return r;
     }
 
+#if HAVE_ZIMG
+    if (ctx->zimg_ok)
+        return mp_zimg_convert(ctx->zimg, dst, src) ? 0 : -1;
+#endif
+
     sws_scale(ctx->sws, (const uint8_t *const *) src->planes, src->stride,
               0, src->h, dst->planes, dst->stride);
     return 0;
@@ -281,7 +354,7 @@ int mp_image_sw_blur_scale(struct mp_image *dst, struct mp_image *src,
                            float gblur)
 {
     struct mp_sws_context *ctx = mp_sws_alloc(NULL);
-    ctx->flags = mp_sws_hq_flags;
+    ctx->flags = SWS_LANCZOS | mp_sws_hq_flags;
     ctx->src_filter = sws_getDefaultFilter(gblur, gblur, 0, 0, 0, 0, 0);
     ctx->force_reload = true;
     int res = mp_sws_scale(ctx, dst, src);

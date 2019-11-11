@@ -31,16 +31,11 @@
 #include <pthread.h>
 #include <assert.h>
 
-#include <libavutil/avstring.h>
-#include <libavutil/common.h>
-
 #include "osdep/io.h"
 #include "misc/rendezvous.h"
 
 #include "input.h"
 #include "keycodes.h"
-#include "cmd_list.h"
-#include "cmd_parse.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "common/msg.h"
@@ -155,9 +150,6 @@ struct input_ctx {
 
     struct cmd_queue cmd_queue;
 
-    void (*cancel)(void *cancel_ctx);
-    void *cancel_ctx;
-
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
 };
@@ -178,6 +170,7 @@ struct input_opts {
     int ar_rate;
     int use_alt_gr;
     int use_appleremote;
+    int use_gamepad;
     int use_media_keys;
     int default_bindings;
     int enable_mouse_movements;
@@ -188,7 +181,7 @@ struct input_opts {
 
 const struct m_sub_options input_config = {
     .opts = (const m_option_t[]) {
-        OPT_STRING("input-conf", config_file, M_OPT_FIXED | M_OPT_FILE),
+        OPT_STRING("input-conf", config_file, M_OPT_FILE),
         OPT_INT("input-ar-delay", ar_delay, 0),
         OPT_INT("input-ar-rate", ar_rate, 0),
         OPT_PRINT("input-keylist", mp_print_key_list),
@@ -203,6 +196,9 @@ const struct m_sub_options input_config = {
         OPT_FLAG("input-media-keys", use_media_keys, 0),
 #if HAVE_COCOA
         OPT_FLAG("input-appleremote", use_appleremote, 0),
+#endif
+#if HAVE_SDL2_GAMEPAD
+        OPT_FLAG("input-gamepad", use_gamepad, 0),
 #endif
         OPT_FLAG("window-dragging", allow_win_drag, 0),
         OPT_REPLACED("input-x11-keyboard", "input-vo-keyboard"),
@@ -533,13 +529,11 @@ static void release_down_cmd(struct input_ctx *ictx, bool drop_current)
 }
 
 // We don't want the append to the command queue indefinitely, because that
-// could lead to situations where recovery would take too long. On the other
-// hand, don't drop commands that will abort playback.
+// could lead to situations where recovery would take too long.
 static bool should_drop_cmd(struct input_ctx *ictx, struct mp_cmd *cmd)
 {
     struct cmd_queue *queue = &ictx->cmd_queue;
-    return queue_count_cmds(queue) >= ictx->opts->key_fifo_size &&
-           !mp_input_is_abort_cmd(cmd);
+    return queue_count_cmds(queue) >= ictx->opts->key_fifo_size;
 }
 
 static struct mp_cmd *resolve_key(struct input_ctx *ictx, int code)
@@ -547,7 +541,7 @@ static struct mp_cmd *resolve_key(struct input_ctx *ictx, int code)
     update_mouse_section(ictx);
     struct mp_cmd *cmd = get_cmd_from_keys(ictx, NULL, code);
     key_buf_add(ictx->key_history, code);
-    if (cmd && cmd->id != MP_CMD_IGNORE && !should_drop_cmd(ictx, cmd))
+    if (cmd && !cmd->def->is_ignore && !should_drop_cmd(ictx, cmd))
         return cmd;
     talloc_free(cmd);
     return NULL;
@@ -626,7 +620,7 @@ static void interpret_key(struct input_ctx *ictx, int code, double scale,
         cmd->scale = 1;
         cmd->scale_units = 1;
         // Avoid spamming the player with too many commands
-        scale_units = FFMIN(scale_units, 20);
+        scale_units = MPMIN(scale_units, 20);
         for (int i = 0; i < scale_units - 1; i++)
             mp_input_queue_cmd(ictx, mp_cmd_clone(cmd));
         if (scale_units)
@@ -880,31 +874,15 @@ static void adjust_max_wait_time(struct input_ctx *ictx, double *time)
 {
     struct input_opts *opts = ictx->opts;
     if (ictx->last_key_down && opts->ar_rate > 0 && ictx->ar_state >= 0) {
-        *time = FFMIN(*time, 1.0 / opts->ar_rate);
-        *time = FFMIN(*time, opts->ar_delay / 1000.0);
+        *time = MPMIN(*time, 1.0 / opts->ar_rate);
+        *time = MPMIN(*time, opts->ar_delay / 1000.0);
     }
-}
-
-static bool test_abort_cmd(struct input_ctx *ictx, struct mp_cmd *new)
-{
-    if (!mp_input_is_maybe_abort_cmd(new))
-        return false;
-    if (mp_input_is_abort_cmd(new))
-        return true;
-    // Abort only if there are going to be at least 2 commands in the queue.
-    for (struct mp_cmd *cmd = ictx->cmd_queue.first; cmd; cmd = cmd->queue_next) {
-        if (mp_input_is_maybe_abort_cmd(cmd))
-            return true;
-    }
-    return false;
 }
 
 int mp_input_queue_cmd(struct input_ctx *ictx, mp_cmd_t *cmd)
 {
     input_lock(ictx);
     if (cmd) {
-        if (ictx->cancel && test_abort_cmd(ictx, cmd))
-            ictx->cancel(ictx->cancel_ctx);
         queue_add_tail(&ictx->cmd_queue, cmd);
         mp_input_wakeup(ictx);
     }
@@ -1013,7 +991,7 @@ void mp_input_enable_section(struct input_ctx *ictx, char *name, int flags)
 
     mp_input_disable_section(ictx, name);
 
-    MP_DBG(ictx, "enable section '%s'\n", name);
+    MP_TRACE(ictx, "enable section '%s'\n", name);
 
     if (ictx->num_active_sections < MAX_ACTIVE_SECTIONS) {
         int top = ictx->num_active_sections;
@@ -1030,10 +1008,10 @@ void mp_input_enable_section(struct input_ctx *ictx, char *name, int flags)
         ictx->num_active_sections++;
     }
 
-    MP_DBG(ictx, "active section stack:\n");
+    MP_TRACE(ictx, "active section stack:\n");
     for (int n = 0; n < ictx->num_active_sections; n++) {
-        MP_DBG(ictx, " %s %d\n", ictx->active_sections[n].name,
-               ictx->active_sections[n].flags);
+        MP_TRACE(ictx, " %s %d\n", ictx->active_sections[n].name,
+                 ictx->active_sections[n].flags);
     }
 
     input_unlock(ictx);
@@ -1193,9 +1171,9 @@ static void bind_keys(struct input_ctx *ictx, bool builtin, bstr section,
     memcpy(bind->keys, keys, num_keys * sizeof(bind->keys[0]));
     if (mp_msg_test(ictx->log, MSGL_DEBUG)) {
         char *s = mp_input_get_key_combo_name(keys, num_keys);
-        MP_DBG(ictx, "add: section='%s' key='%s'%s cmd='%s' location='%s'\n",
-               bind->owner->section, s, bind->is_builtin ? " builtin" : "",
-               bind->cmd, bind->location);
+        MP_TRACE(ictx, "add: section='%s' key='%s'%s cmd='%s' location='%s'\n",
+                 bind->owner->section, s, bind->is_builtin ? " builtin" : "",
+                 bind->cmd, bind->location);
         talloc_free(s);
     }
 }
@@ -1393,8 +1371,17 @@ void mp_input_load_config(struct input_ctx *ictx)
     }
 
 #if HAVE_WIN32_PIPES
-    if (ictx->global->opts->input_file && *ictx->global->opts->input_file)
-        mp_input_pipe_add(ictx, ictx->global->opts->input_file);
+    char *ifile;
+    mp_read_option_raw(ictx->global, "input-file", &m_option_type_string, &ifile);
+    if (ifile && ifile[0])
+        mp_input_pipe_add(ictx, ifile);
+    talloc_free(ifile);
+#endif
+
+#if HAVE_SDL2_GAMEPAD
+    if (ictx->opts->use_gamepad) {
+        mp_input_sdl_gamepad_add(ictx);
+    }
 #endif
 
     input_unlock(ictx);
@@ -1425,14 +1412,6 @@ void mp_input_uninit(struct input_ctx *ictx)
     talloc_free(ictx);
 }
 
-void mp_input_set_cancel(struct input_ctx *ictx, void (*cb)(void *c), void *c)
-{
-    input_lock(ictx);
-    ictx->cancel = cb;
-    ictx->cancel_ctx = c;
-    input_unlock(ictx);
-}
-
 bool mp_input_use_alt_gr(struct input_ctx *ictx)
 {
     input_lock(ictx);
@@ -1452,12 +1431,50 @@ bool mp_input_use_media_keys(struct input_ctx *ictx)
 struct mp_cmd *mp_input_parse_cmd(struct input_ctx *ictx, bstr str,
                                   const char *location)
 {
-    return mp_input_parse_cmd_(ictx->log, str, location);
+    return mp_input_parse_cmd_str(ictx->log, str, location);
 }
 
 void mp_input_run_cmd(struct input_ctx *ictx, const char **cmd)
 {
     mp_input_queue_cmd(ictx, mp_input_parse_cmd_strv(ictx->log, cmd));
+}
+
+void mp_input_bind_key(struct input_ctx *ictx, int key, bstr command)
+{
+    struct cmd_bind_section *bs = ictx->cmd_bind_sections;
+    struct cmd_bind *bind = NULL;
+
+    for (int n = 0; n < bs->num_binds; n++) {
+        struct cmd_bind *b = &bs->binds[n];
+        if (bind_matches_key(b, 1, &key) && b->is_builtin == false) {
+            bind = b;
+            break;
+        }
+    }
+
+    if (!bind) {
+        struct cmd_bind empty = {{0}};
+        MP_TARRAY_APPEND(bs, bs->binds, bs->num_binds, empty);
+        bind = &bs->binds[bs->num_binds - 1];
+    }
+
+    bind_dealloc(bind);
+
+    *bind = (struct cmd_bind) {
+        .cmd = bstrdup0(bs->binds, command),
+        .location = talloc_strdup(bs->binds, "keybind-command"),
+        .owner = bs,
+        .is_builtin = false,
+        .num_keys = 1,
+    };
+    memcpy(bind->keys, &key, 1 * sizeof(bind->keys[0]));
+    if (mp_msg_test(ictx->log, MSGL_DEBUG)) {
+        char *s = mp_input_get_key_combo_name(&key, 1);
+        MP_TRACE(ictx, "add:section='%s' key='%s'%s cmd='%s' location='%s'\n",
+                 bind->owner->section, s, bind->is_builtin ? " builtin" : "",
+                 bind->cmd, bind->location);
+        talloc_free(s);
+    }
 }
 
 struct mp_input_src_internal {
@@ -1605,7 +1622,7 @@ void mp_input_src_feed_cmd_text(struct mp_input_src *src, char *buf, size_t len)
             if (term) {
                 bstr s = {in->cmd_buffer, in->cmd_buffer_size};
                 s = bstr_strip(s);
-                struct mp_cmd *cmd= mp_input_parse_cmd_(src->log, s, "<>");
+                struct mp_cmd *cmd = mp_input_parse_cmd_str(src->log, s, "<>");
                 if (cmd)
                     mp_input_queue_cmd(src->input_ctx, cmd);
                 in->cmd_buffer_size = 0;

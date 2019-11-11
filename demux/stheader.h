@@ -45,11 +45,17 @@ struct sh_stream {
     char *lang;                 // language code
     bool default_track;         // container default track flag
     bool forced_track;          // container forced track flag
+    bool dependent_track;       // container dependent track flag
+    bool visual_impaired_track; // container flag
+    bool hearing_impaired_track;// container flag
+    bool still_image;           // video stream contains still images
     int hls_bitrate;
 
     struct mp_tags *tags;
 
     bool missing_timestamps;
+
+    double seek_preroll;
 
     // stream is a picture (such as album art)
     struct demux_packet *attached_picture;
@@ -76,6 +82,11 @@ struct mp_codec_params {
     // Timestamp granularity for converting double<->rational timestamps.
     int native_tb_num, native_tb_den;
 
+    // Used by an obscure bug workaround mechanism. As an exception to the usual
+    // rules, demuxers are allowed to set this after adding the sh_stream, but
+    // only before the demuxer open call returns.
+    struct demux_packet *first_packet;
+
     // STREAM_AUDIO
     int samplerate;
     struct mp_chmap channels;
@@ -93,7 +104,6 @@ struct mp_codec_params {
     int rotate;           // intended display rotation, in degrees, [0, 359]
     int stereo_mode;      // mp_stereo3d_mode (0 if none/unknown)
     struct mp_colorspace color; // colorspace info where available
-    struct mp_spherical_params spherical;
 
     // STREAM_VIDEO + STREAM_AUDIO
     int bits_per_coded_sample;

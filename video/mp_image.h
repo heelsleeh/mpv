@@ -28,28 +28,15 @@
 #include "csputils.h"
 #include "video/img_format.h"
 
+// Assumed minimum align needed for image allocation. It's notable that FFmpeg's
+// libraries except libavcodec don't really know what alignment they want.
+// Things will randomly crash or get slower if the alignment is not satisfied.
+// Whatever. This value should be pretty safe with current CPU architectures.
+#define MP_IMAGE_BYTE_ALIGN 64
+
 #define MP_IMGFIELD_TOP_FIRST 0x02
 #define MP_IMGFIELD_REPEAT_FIRST 0x04
 #define MP_IMGFIELD_INTERLACED 0x20
-
-enum mp_spherical_type {
-    MP_SPHERICAL_AUTO = 0,
-    MP_SPHERICAL_NONE,              // normal video
-    MP_SPHERICAL_UNKNOWN,           // unknown projection
-    MP_SPHERICAL_EQUIRECTANGULAR,   // (untiled)
-};
-
-extern const struct m_opt_choice_alternatives mp_spherical_names[];
-
-struct mp_spherical_params {
-    enum mp_spherical_type type;
-    float ref_angles[3]; // yaw/pitch/roll, refer to AVSphericalMapping
-};
-
-enum mp_image_hw_flags {
-    MP_IMAGE_HW_FLAG_OPAQUE = 1,    // an opaque hw format is used - the exact
-                                    // format is subject to hwctx internals
-};
 
 // Describes image parameters that usually stay constant.
 // New fields can be added in the future. Code changing the parameters should
@@ -57,16 +44,13 @@ enum mp_image_hw_flags {
 struct mp_image_params {
     enum mp_imgfmt imgfmt;      // pixel format
     enum mp_imgfmt hw_subfmt;   // underlying format for some hwaccel pixfmts
-    unsigned hw_flags;          // bit mask of mp_image_hw_flags
     int w, h;                   // image dimensions
     int p_w, p_h;               // define pixel aspect ratio (undefined: 0/0)
     struct mp_colorspace color;
     enum mp_chroma_location chroma_location;
     // The image should be rotated clockwise (0-359 degrees).
     int rotate;
-    enum mp_stereo3d_mode stereo_in;    // image is encoded with this mode
-    enum mp_stereo3d_mode stereo_out;   // should be displayed with this mode
-    struct mp_spherical_params spherical;
+    enum mp_stereo3d_mode stereo3d; // image is encoded with this mode
 };
 
 /* Memory management:
@@ -105,6 +89,8 @@ typedef struct mp_image {
     double pts;
     /* only after decoder */
     double dts, pkt_duration;
+    /* container reported FPS; can be incorrect, or 0 if unknown */
+    double nominal_fps;
     /* for private use */
     void* priv;
 
@@ -119,7 +105,17 @@ typedef struct mp_image {
     struct AVBufferRef *hwctx;
     // Embedded ICC profile, if any
     struct AVBufferRef *icc_profile;
+    // Closed captions packet, if any (only after decoder)
+    struct AVBufferRef *a53_cc;
+    // Other side data we don't care about.
+    struct mp_ff_side_data *ff_side_data;
+    int num_ff_side_data;
 } mp_image_t;
+
+struct mp_ff_side_data {
+    int type;
+    struct AVBufferRef *buf;
+};
 
 int mp_chroma_div_up(int size, int shift);
 
@@ -151,6 +147,8 @@ int mp_image_plane_h(struct mp_image *mpi, int plane);
 void mp_image_setfmt(mp_image_t* mpi, int out_fmt);
 void mp_image_steal_data(struct mp_image *dst, struct mp_image *src);
 void mp_image_unref_data(struct mp_image *img);
+
+int mp_image_approx_byte_size(struct mp_image *img);
 
 struct mp_image *mp_image_new_dummy_ref(struct mp_image *img);
 struct mp_image *mp_image_new_custom_ref(struct mp_image *img, void *arg,

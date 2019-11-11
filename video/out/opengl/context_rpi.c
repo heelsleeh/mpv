@@ -139,7 +139,7 @@ static bool recreate_dispmanx(struct ra_ctx *ctx)
     VC_RECT_T dst = {.x = p->x, .y = p->y, .width = p->w, .height = p->h};
     VC_RECT_T src = {.width = p->w << 16, .height = p->h << 16};
     VC_DISPMANX_ALPHA_T alpha = {
-        .flags = DISPMANX_FLAGS_ALPHA_FROM_SOURCE,
+        .flags = DISPMANX_FLAGS_ALPHA_FIXED_ALL_PIXELS,
         .opacity = 0xFF,
     };
     p->window = vc_dispmanx_element_add(p->update, p->display, layer, &dst, 0,
@@ -198,7 +198,8 @@ static bool recreate_dispmanx(struct ra_ctx *ctx)
 
     ctx->vo->dwidth = p->w;
     ctx->vo->dheight = p->h;
-    ra_gl_ctx_resize(ctx->swapchain, p->w, p->h, 0);
+    if (ctx->swapchain)
+        ra_gl_ctx_resize(ctx->swapchain, p->w, p->h, 0);
 
     ctx->vo->want_redraw = true;
 
@@ -233,20 +234,21 @@ static bool rpi_init(struct ra_ctx *ctx)
     if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context, &p->egl_config))
         goto fail;
 
-    if (recreate_dispmanx(ctx) < 0)
+    if (!recreate_dispmanx(ctx))
         goto fail;
 
     mpegl_load_functions(&p->gl, ctx->log);
 
     struct ra_gl_ctx_params params = {
         .swap_buffers = rpi_swap_buffers,
-        .native_display_type = "MPV_RPI_WINDOW",
-        .native_display = p->win_params,
     };
 
     if (!ra_gl_ctx_init(ctx, &p->gl, params))
         goto fail;
 
+    ra_add_native_resource(ctx->ra, "MPV_RPI_WINDOW", p->win_params);
+
+    ra_gl_ctx_resize(ctx->swapchain, ctx->vo->dwidth, ctx->vo->dheight, 0);
     return true;
 
 fail:

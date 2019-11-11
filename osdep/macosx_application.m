@@ -23,6 +23,7 @@
 #include "common/msg.h"
 #include "input/input.h"
 #include "player/client.h"
+#include "options/m_config.h"
 
 #import "osdep/macosx_application_objc.h"
 #include "osdep/macosx_compat.h"
@@ -33,8 +34,48 @@
 #if HAVE_MACOS_TOUCHBAR
 #import "osdep/macosx_touchbar.h"
 #endif
+#if HAVE_MACOS_COCOA_CB
+#include "osdep/macOS_swift.h"
+#endif
 
 #define MPV_PROTOCOL @"mpv://"
+
+#define OPT_BASE_STRUCT struct macos_opts
+const struct m_sub_options macos_conf = {
+    .opts = (const struct m_option[]) {
+        OPT_CHOICE("macos-title-bar-appearance", macos_title_bar_appearance, 0,
+                   ({"auto", 0}, {"aqua", 1}, {"darkAqua", 2},
+                    {"vibrantLight", 3}, {"vibrantDark", 4},
+                    {"aquaHighContrast", 5}, {"darkAquaHighContrast", 6},
+                    {"vibrantLightHighContrast", 7},
+                    {"vibrantDarkHighContrast", 8})),
+        OPT_CHOICE("macos-title-bar-material", macos_title_bar_material, 0,
+                   ({"titlebar", 0}, {"selection", 1}, {"menu", 2},
+                    {"popover", 3}, {"sidebar", 4}, {"headerView", 5},
+                    {"sheet", 6}, {"windowBackground", 7}, {"hudWindow", 8},
+                    {"fullScreen", 9}, {"toolTip", 10}, {"contentBackground", 11},
+                    {"underWindowBackground", 12}, {"underPageBackground", 13},
+                    {"dark", 14}, {"light", 15}, {"mediumLight", 16},
+                    {"ultraDark", 17})),
+        OPT_COLOR("macos-title-bar-color", macos_title_bar_color, 0),
+        OPT_CHOICE_OR_INT("macos-fs-animation-duration",
+                          macos_fs_animation_duration, 0, 0, 1000,
+                          ({"default", -1})),
+        OPT_CHOICE("cocoa-cb-sw-renderer", cocoa_cb_sw_renderer, 0,
+                   ({"auto", -1}, {"no", 0}, {"yes", 1})),
+        OPT_FLAG("cocoa-cb-10bit-context", cocoa_cb_10bit_context, 0),
+        OPT_REMOVED("macos-title-bar-style", "Split into --macos-title-bar-appearance "
+                     "and --macos-title-bar-material"),
+        {0}
+    },
+    .size = sizeof(struct macos_opts),
+    .defaults = &(const struct macos_opts){
+        .macos_title_bar_color = {0, 0, 0, 0},
+        .macos_fs_animation_duration = -1,
+        .cocoa_cb_sw_renderer = -1,
+        .cocoa_cb_10bit_context = 1
+    },
+};
 
 // Whether the NSApplication singleton was created. If this is false, we are
 // running in libmpv mode, and cocoa_main() was never called.
@@ -61,8 +102,9 @@ static void terminate_cocoa_application(void)
 }
 
 @implementation Application
-@synthesize menuBar = _menu_Bar;
+@synthesize menuBar = _menu_bar;
 @synthesize openCount = _open_count;
+@synthesize cocoaCB = _cocoa_cb;
 
 - (void)sendEvent:(NSEvent *)event
 {
@@ -96,6 +138,19 @@ static void terminate_cocoa_application(void)
     [super dealloc];
 }
 
+static const char macosx_icon[] =
+#include "osdep/macosx_icon.inc"
+;
+
+- (NSImage *)getMPVIcon
+{
+    // The C string contains a trailing null, so we strip it away
+    NSData *icon_data = [NSData dataWithBytesNoCopy:(void *)macosx_icon
+                                             length:sizeof(macosx_icon) - 1
+                                       freeWhenDone:NO];
+    return [[NSImage alloc] initWithData:icon_data];
+}
+
 #if HAVE_MACOS_TOUCHBAR
 - (NSTouchBar *)makeTouchBar
 {
@@ -117,6 +172,21 @@ static void terminate_cocoa_application(void)
     if ([self respondsToSelector:@selector(touchBar)])
         [(TouchBar *)self.touchBar processEvent:event];
 #endif
+    if (_cocoa_cb) {
+        [_cocoa_cb processEvent:event];
+    }
+}
+
+- (void)setMpvHandle:(struct mpv_handle *)ctx
+{
+#if HAVE_MACOS_COCOA_CB
+    [NSApp setCocoaCB:[[CocoaCB alloc] init:ctx]];
+#endif
+}
+
+- (const struct m_sub_options *)getMacOSConf
+{
+    return &macos_conf;
 }
 
 - (void)queueCommand:(char *)cmd
